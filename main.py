@@ -1077,3 +1077,156 @@ async def get_emerging_analysis(x_token: str = Header(default=None)):
         "source_tpex": "https://www.tpex.org.tw/www/zh-tw/emerging/latest",
         "esb_total": len(stock_map), "has_quote": True,
     }
+
+
+# ════════════════════════════════════════════════════════
+#  /chips/{symbol}  —  籌碼分析端點  v2（完全使用 FinMind）
+# ════════════════════════════════════════════════════════
+
+@app.get("/chips/{symbol}")
+async def get_chips(symbol: str, x_token: str = Header(default=None)):
+    verify_token(x_token)
+
+    today      = datetime.today()
+    start_30   = (today - timedelta(days=45)).strftime("%Y-%m-%d")
+    end_date   = today.strftime("%Y-%m-%d")
+
+    # 1. 三大法人
+    inst_rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", symbol, start_30, end_date)
+    latest_date = max((r["date"] for r in inst_rows), default="")
+    inst_today = {"foreign_net": 0, "invest_trust_net": 0, "dealer_net": 0}
+    for row in inst_rows:
+        if row["date"] != latest_date:
+            continue
+        name = row.get("name", "")
+        net  = int(row.get("buy", 0)) // 1000 - int(row.get("sell", 0)) // 1000
+        if name == "Foreign_Investor":
+            inst_today["foreign_net"] = net
+        elif name == "Investment_Trust":
+            inst_today["invest_trust_net"] = net
+        elif name == "Dealer_self":
+            inst_today["dealer_net"] = net
+
+    # 2. 融資融券
+    margin_rows = finmind_get("TaiwanStockMarginPurchaseShortSale", symbol, start_30, end_date)
+    margin_today = {}
+    if margin_rows:
+        last = margin_rows[-1]
+        m_bal  = int(last.get("MarginPurchaseTodayBalance", 0))
+        m_prev = int(last.get("MarginPurchaseYesterdayBalance", 0))
+        s_bal  = int(last.get("ShortSaleTodayBalance", 0))
+        s_prev = int(last.get("ShortSaleYesterdayBalance", 0))
+        margin_today = {
+            "margin_balance":     m_bal,
+            "margin_change":      m_bal - m_prev,
+            "short_balance":      s_bal,
+            "short_change":       s_bal - s_prev,
+            "short_margin_ratio": round(s_bal / m_bal * 100, 2) if m_bal > 0 else 0.0,
+        }
+
+    # 3. 收盤價 / 成交量
+    price_rows = finmind_get("TaiwanStockPrice", symbol, start_30, end_date)
+    price_today = {}
+    if price_rows:
+        last_p = price_rows[-1]
+        price_today = {
+            "price":  float(last_p.get("close", 0)),
+            "volume": int(last_p.get("Trading_Volume", 0)) // 1000,
+            "date":   last_p.get("date", ""),
+        }
+
+    # 4. 當沖
+    daytrade_today = {}
+    try:
+        dt_rows = finmind_get("TaiwanStockDayTrading", symbol, start_30, end_date)
+        if dt_rows:
+            last_dt = dt_rows[-1]
+            dt_vol  = int(last_dt.get("DayTradingBuyVolume", 0)) // 1000
+            tot_vol = price_today.get("volume", 0)
+            daytrade_today = {
+                "day_trade_volume": dt_vol,
+                "day_trade_ratio":  round(dt_vol / tot_vol * 100, 2) if tot_vol > 0 else 0.0,
+            }
+    except Exception:
+        pass
+
+    # 5. 籌碼集中度
+    concentration = 0.0
+    try:
+        recent_dates = sorted(set(r["date"] for r in price_rows))[-5:]
+        vol_5d = sum(int(r.get("Trading_Volume", 0)) // 1000 for r in price_rows if r["date"] in recent_dates)
+        net_5d = sum(
+            int(r.get("buy", 0)) // 1000 - int(r.get("sell", 0)) // 1000
+            for r in inst_rows
+            if r["date"] in recent_dates and r.get("name") in ("Foreign_Investor", "Investment_Trust", "Dealer_self")
+        )
+        if vol_5d > 0:
+            concentration = round(abs(net_5d) / vol_5d * 100, 2)
+    except Exception:
+        pass
+
+    # 6. 近10日三大法人歷史
+    history = []
+    try:
+        price_map = {r["date"]: float(r.get("close", 0)) for r in price_rows}
+        date_inst: dict = {}
+        for row in inst_rows:
+            d_ = row["date"]
+            name = row.get("name", "")
+            net  = int(row.get("buy", 0)) // 1000 - int(row.get("sell", 0)) // 1000
+            if d_ not in date_inst:
+                date_inst[d_] = {"date": d_, "foreign_net": 0, "invest_trust_net": 0, "dealer_net": 0}
+            if name == "Foreign_Investor":
+                date_inst[d_]["foreign_net"] = net
+            elif name == "Investment_Trust":
+                date_inst[d_]["invest_trust_net"] = net
+            elif name == "Dealer_self":
+                date_inst[d_]["dealer_net"] = net
+        for d_, info in sorted(date_inst.items()):
+            info["close"] = price_map.get(d_)
+            history.append(info)
+        history = history[-10:]
+    except Exception:
+        pass
+
+    # 7. 近10日融資融券歷史
+    margin_history = []
+    try:
+        for row in margin_rows:
+            m_bal  = int(row.get("MarginPurchaseTodayBalance", 0))
+            m_prev = int(row.get("MarginPurchaseYesterdayBalance", 0))
+            s_bal  = int(row.get("ShortSaleTodayBalance", 0))
+            s_prev = int(row.get("ShortSaleYesterdayBalance", 0))
+            margin_history.append({
+                "date":              row["date"],
+                "margin_balance":    m_bal,
+                "margin_change":     m_bal - m_prev,
+                "short_balance":     s_bal,
+                "short_change":      s_bal - s_prev,
+                "short_margin_ratio": round(s_bal / m_bal * 100, 2) if m_bal > 0 else 0.0,
+            })
+        margin_history = margin_history[-10:]
+    except Exception:
+        pass
+
+    today_data = {
+        **inst_today,
+        **margin_today,
+        **price_today,
+        **daytrade_today,
+        "concentration": concentration,
+        "main_net":      inst_today.get("foreign_net", 0) + inst_today.get("invest_trust_net", 0),
+        "mid_holder":    None,
+        "gov_net":       None,
+        "family_diff":   None,
+        "borrow_sell_balance": None,
+        "borrow_sell_change":  None,
+    }
+
+    return {
+        "data":           today_data,
+        "history":        history,
+        "margin_history": margin_history,
+        "source":         "finmind",
+        "date":           latest_date or today.strftime("%Y-%m-%d"),
+    }
