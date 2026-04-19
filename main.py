@@ -1232,83 +1232,86 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     }
 
 # ══════════════════════════════════════════════
-# 以下三個 API 貼到 main.py 最後面
+# 以下程式碼貼到 main.py 最後面（取代舊的 main_additions.py）
 # ══════════════════════════════════════════════
 
-# ── 1. 外資買賣超排行 ─────────────────────────
+# ── 外資買賣超排行 ─────────────────────────────
 @app.get("/foreign_rank")
 async def get_foreign_rank(x_token: str = Header(default=None)):
     """
-    抓 TWSE 當日三大法人明細，回傳外資買超前20、賣超前20
-    來源：TWSE STOCK_DAY_ALL（含外資）
+    抓 TWSE T86 三大法人買賣超明細，回傳外資買超前20、賣超前20
+    資料來源：TWSE T86（與 market_volume 同一伺服器，Railway 可正常存取）
     """
     verify_token(x_token)
     today = datetime.today()
 
-    for i in range(5):
+    for i in range(1, 8):  # 往回找最近7天，避開假日
         try_date = (today - timedelta(days=i)).strftime("%Y%m%d")
-
-        # 用 FinMind 全市場當日外資買賣超（按日期查所有個股）
-        # 取前一天的資料（FinMind 通常 T+1）
-        fm_date = (today - timedelta(days=i+1)).strftime("%Y-%m-%d")
         url = (
-            f"https://api.finmindtrade.com/api/v4/data"
-            f"?dataset=TaiwanStockInstitutionalInvestorsBuySell"
-            f"&start_date={fm_date}&end_date={fm_date}"
-            f"&token={FINMIND_TOKEN}"
+            f"https://www.twse.com.tw/rwd/zh/fund/T86"
+            f"?response=json&date={try_date}&selectType=ALL"
         )
         data = twse_get(url)
-        if not data or data.get("msg") != "success":
+
+        if not data or data.get("stat") != "OK":
             continue
-        rows = data.get("data", [])
+
+        fields = data.get("fields", [])
+        rows   = data.get("data", [])
         if not rows:
             continue
 
-        # 只取外資，計算淨買超
-        foreign = {}
-        for r in rows:
-            if r.get("name") != "Foreign_Investor":
-                continue
-            code = r.get("stock_id", "")
-            buy  = max(int(r.get("buy",  0)), 0) // 1000
-            sell = max(int(r.get("sell", 0)), 0) // 1000
-            net  = buy - sell
-            if code:
-                foreign[code] = {
-                    "code": code,
-                    "buy": buy, "sell": sell, "net": net
-                }
+        # 找欄位 index（T86 固定欄位）
+        def fi(name, default):
+            try: return fields.index(name)
+            except ValueError: return default
 
-        if not foreign:
+        idx_code  = fi("證券代號", 0)
+        idx_name  = fi("證券名稱", 1)
+        idx_fbuy  = fi("外陸資買進股數", 2)
+        idx_fsell = fi("外陸資賣出股數", 3)
+        idx_fnet  = fi("外陸資淨買賣超股數", 4)
+
+        def parse_num(s):
+            try:
+                return int(str(s).replace(",", "").replace(" ", "")) // 1000
+            except Exception:
+                return 0
+
+        items = []
+        for row in rows:
+            try:
+                code = str(row[idx_code]).strip()
+                name = str(row[idx_name]).strip()
+                if not code.isdigit():
+                    continue
+                buy  = parse_num(row[idx_fbuy])
+                sell = parse_num(row[idx_fsell])
+                net  = parse_num(row[idx_fnet])
+                items.append({"code": code, "name": name,
+                              "buy": buy, "sell": sell, "net": net})
+            except Exception:
+                continue
+
+        if not items:
             continue
 
-        # 補股票名稱（從 FinMind TaiwanStockInfo）
-        name_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&start_date=2024-01-01&token={FINMIND_TOKEN}"
-        name_data = twse_get(name_url)
-        name_map = {}
-        if name_data and name_data.get("msg") == "success":
-            for s in name_data.get("data", []):
-                name_map[s.get("stock_id", "")] = s.get("stock_name", "")
+        buy_top  = sorted(items, key=lambda x: x["net"],  reverse=True)[:20]
+        sell_top = sorted(items, key=lambda x: x["net"])[:20]
 
-        # 補名稱
-        for code, item in foreign.items():
-            item["name"] = name_map.get(code, code)
-
-        # 排序取前20
-        all_items = list(foreign.values())
-        buy_top  = sorted(all_items, key=lambda x: x["net"],  reverse=True)[:20]
-        sell_top = sorted(all_items, key=lambda x: x["net"])[:20]
-
+        date_str = f"{try_date[:4]}-{try_date[4:6]}-{try_date[6:]}"
         return {
-            "date": fm_date,
+            "date": date_str,
             "buy_top":  buy_top,
             "sell_top": sell_top,
-            "total_stocks": len(foreign)
+            "total_stocks": len(items)
         }
 
-    return {"date": "", "buy_top": [], "sell_top": [], "total_stocks": 0,
-            "error": "無法取得資料"}
-
+    return {
+        "date": "", "buy_top": [], "sell_top": [],
+        "total_stocks": 0,
+        "error": "無法取得資料（請確認為交易日）"
+    }
 
 # ── 2. 產業輪動統計 ──────────────────────────
 @app.post("/sector_rotation")
