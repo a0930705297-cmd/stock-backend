@@ -1230,3 +1230,115 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
         "source":         "finmind",
         "date":           latest_date or today.strftime("%Y-%m-%d"),
     }
+
+# ══════════════════════════════════════════════
+# 以下三個 API 貼到 main.py 最後面
+# ══════════════════════════════════════════════
+
+# ── 1. 外資買賣超排行 ─────────────────────────
+@app.get("/foreign_rank")
+async def get_foreign_rank(x_token: str = Header(default=None)):
+    """
+    抓 TWSE 當日三大法人明細，回傳外資買超前20、賣超前20
+    來源：TWSE STOCK_DAY_ALL（含外資）
+    """
+    verify_token(x_token)
+    today = datetime.today()
+
+    for i in range(5):
+        try_date = (today - timedelta(days=i)).strftime("%Y%m%d")
+
+        # 用 FinMind 全市場當日外資買賣超（按日期查所有個股）
+        # 取前一天的資料（FinMind 通常 T+1）
+        fm_date = (today - timedelta(days=i+1)).strftime("%Y-%m-%d")
+        url = (
+            f"https://api.finmindtrade.com/api/v4/data"
+            f"?dataset=TaiwanStockInstitutionalInvestorsBuySell"
+            f"&start_date={fm_date}&end_date={fm_date}"
+            f"&token={FINMIND_TOKEN}"
+        )
+        data = twse_get(url)
+        if not data or data.get("msg") != "success":
+            continue
+        rows = data.get("data", [])
+        if not rows:
+            continue
+
+        # 只取外資，計算淨買超
+        foreign = {}
+        for r in rows:
+            if r.get("name") != "Foreign_Investor":
+                continue
+            code = r.get("stock_id", "")
+            buy  = max(int(r.get("buy",  0)), 0) // 1000
+            sell = max(int(r.get("sell", 0)), 0) // 1000
+            net  = buy - sell
+            if code:
+                foreign[code] = {
+                    "code": code,
+                    "buy": buy, "sell": sell, "net": net
+                }
+
+        if not foreign:
+            continue
+
+        # 補股票名稱（從 FinMind TaiwanStockInfo）
+        name_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&start_date=2024-01-01&token={FINMIND_TOKEN}"
+        name_data = twse_get(name_url)
+        name_map = {}
+        if name_data and name_data.get("msg") == "success":
+            for s in name_data.get("data", []):
+                name_map[s.get("stock_id", "")] = s.get("stock_name", "")
+
+        # 補名稱
+        for code, item in foreign.items():
+            item["name"] = name_map.get(code, code)
+
+        # 排序取前20
+        all_items = list(foreign.values())
+        buy_top  = sorted(all_items, key=lambda x: x["net"],  reverse=True)[:20]
+        sell_top = sorted(all_items, key=lambda x: x["net"])[:20]
+
+        return {
+            "date": fm_date,
+            "buy_top":  buy_top,
+            "sell_top": sell_top,
+            "total_stocks": len(foreign)
+        }
+
+    return {"date": "", "buy_top": [], "sell_top": [], "total_stocks": 0,
+            "error": "無法取得資料"}
+
+
+# ── 2. 產業輪動統計 ──────────────────────────
+@app.post("/sector_rotation")
+async def get_sector_rotation(body: dict, x_token: str = Header(default=None)):
+    """
+    輸入掃描結果（含 code、scoreA、scoreB1、industry），
+    統計各產業的 ABC 通過率與外資淨買總量
+    """
+    verify_token(x_token)
+    items = body.get("items", [])
+    if not items:
+        return {"data": []}
+
+    # 按產業分組
+    sector_map = {}
+    for item in items:
+        ind = item.get("industry", "其他")
+        if not ind:
+            ind = "其他"
+        if ind not in sector_map:
+            sector_map[ind] = {"industry": ind, "total": 0, "a_pass": 0, "ab_pass": 0, "abc_pass": 0, "net_buy": 0}
+        s = sector_map[ind]
+        s["total"] += 1
+        if item.get("scoreA"):
+            s["a_pass"] += 1
+        if item.get("scoreA") and item.get("scoreB1"):
+            s["ab_pass"] += 1
+        if item.get("scoreA") and item.get("scoreB1") and item.get("scoreB2"):
+            s["abc_pass"] += 1
+        s["net_buy"] += item.get("net20", 0)
+
+    result = sorted(sector_map.values(), key=lambda x: x["ab_pass"], reverse=True)
+    return {"data": result}
