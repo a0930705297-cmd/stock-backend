@@ -1078,7 +1078,6 @@ async def get_emerging_analysis(x_token: str = Header(default=None)):
         "esb_total": len(stock_map), "has_quote": True,
     }
 
-
 # ════════════════════════════════════════════════════════
 #  /chips/{symbol}  —  籌碼分析端點  v2（完全使用 FinMind）
 # ════════════════════════════════════════════════════════
@@ -1232,26 +1231,53 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     }
 
 # ══════════════════════════════════════════════
-# 以下程式碼貼到 main.py 最後面（取代舊的 main_additions.py）
+# 把這段全部貼到 main.py 最後面
+# 取代之前的 /foreign_rank
 # ══════════════════════════════════════════════
 
-# ── 外資買賣超排行 ─────────────────────────────
+# ── 除錯端點：確認 T86 原始回傳 ─────────────
+@app.get("/debug_t86")
+async def debug_t86(x_token: str = Header(default=None)):
+    """暫時除錯用：看 T86 實際回傳什麼"""
+    verify_token(x_token)
+    today = datetime.today()
+    results = []
+    for i in range(1, 6):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL"
+        try:
+            r = requests.get(url, verify=False, timeout=10,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            results.append({
+                "date": d,
+                "status": r.status_code,
+                "text_preview": r.text[:300],
+                "url": url
+            })
+        except Exception as e:
+            results.append({"date": d, "error": str(e), "url": url})
+    return {"results": results}
+
+
+# ── 外資買賣超排行（修正版）──────────────────
 @app.get("/foreign_rank")
 async def get_foreign_rank(x_token: str = Header(default=None)):
-    """
-    抓 TWSE T86 三大法人買賣超明細，回傳外資買超前20、賣超前20
-    資料來源：TWSE T86（與 market_volume 同一伺服器，Railway 可正常存取）
-    """
     verify_token(x_token)
     today = datetime.today()
 
-    for i in range(1, 8):  # 往回找最近7天，避開假日
-        try_date = (today - timedelta(days=i)).strftime("%Y%m%d")
-        url = (
-            f"https://www.twse.com.tw/rwd/zh/fund/T86"
-            f"?response=json&date={try_date}&selectType=ALL"
-        )
-        data = twse_get(url)
+    for i in range(1, 8):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+
+        # 試兩種 URL 格式
+        urls = [
+            f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL",
+            f"https://www.twse.com.tw/fund/T86?response=json&date={d}&selectType=ALL",
+        ]
+        data = None
+        for url in urls:
+            data = twse_get(url)
+            if data and data.get("stat") == "OK":
+                break
 
         if not data or data.get("stat") != "OK":
             continue
@@ -1261,20 +1287,22 @@ async def get_foreign_rank(x_token: str = Header(default=None)):
         if not rows:
             continue
 
-        # 找欄位 index（T86 固定欄位）
         def fi(name, default):
             try: return fields.index(name)
             except ValueError: return default
 
+        # T86 可能的欄位名稱
         idx_code  = fi("證券代號", 0)
         idx_name  = fi("證券名稱", 1)
-        idx_fbuy  = fi("外陸資買進股數", 2)
-        idx_fsell = fi("外陸資賣出股數", 3)
-        idx_fnet  = fi("外陸資淨買賣超股數", 4)
+        # 外資欄位有多種可能名稱
+        idx_fbuy  = fi("外陸資買進股數", fi("外資及陸資買進股數", 2))
+        idx_fsell = fi("外陸資賣出股數", fi("外資及陸資賣出股數", 3))
+        idx_fnet  = fi("外陸資淨買賣超股數", fi("外資及陸資淨買賣超股數", 4))
 
         def parse_num(s):
             try:
-                return int(str(s).replace(",", "").replace(" ", "")) // 1000
+                v = int(str(s).replace(",", "").replace(" ", ""))
+                return v // 1000  # 轉換為張
             except Exception:
                 return 0
 
@@ -1298,8 +1326,8 @@ async def get_foreign_rank(x_token: str = Header(default=None)):
 
         buy_top  = sorted(items, key=lambda x: x["net"],  reverse=True)[:20]
         sell_top = sorted(items, key=lambda x: x["net"])[:20]
+        date_str = f"{d[:4]}-{d[4:6]}-{d[6:]}"
 
-        date_str = f"{try_date[:4]}-{try_date[4:6]}-{try_date[6:]}"
         return {
             "date": date_str,
             "buy_top":  buy_top,
