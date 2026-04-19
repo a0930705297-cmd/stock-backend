@@ -1231,35 +1231,9 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     }
 
 # ══════════════════════════════════════════════
-# 把這段全部貼到 main.py 最後面
-# 取代之前的 /foreign_rank
+# 貼到 main.py 最後面，取代舊的 /foreign_rank
 # ══════════════════════════════════════════════
 
-# ── 除錯端點：確認 T86 原始回傳 ─────────────
-@app.get("/debug_t86")
-async def debug_t86(x_token: str = Header(default=None)):
-    """暫時除錯用：看 T86 實際回傳什麼"""
-    verify_token(x_token)
-    today = datetime.today()
-    results = []
-    for i in range(1, 6):
-        d = (today - timedelta(days=i)).strftime("%Y%m%d")
-        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL"
-        try:
-            r = requests.get(url, verify=False, timeout=10,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            results.append({
-                "date": d,
-                "status": r.status_code,
-                "text_preview": r.text[:300],
-                "url": url
-            })
-        except Exception as e:
-            results.append({"date": d, "error": str(e), "url": url})
-    return {"results": results}
-
-
-# ── 外資買賣超排行（修正版）──────────────────
 @app.get("/foreign_rank")
 async def get_foreign_rank(x_token: str = Header(default=None)):
     verify_token(x_token)
@@ -1267,17 +1241,8 @@ async def get_foreign_rank(x_token: str = Header(default=None)):
 
     for i in range(1, 8):
         d = (today - timedelta(days=i)).strftime("%Y%m%d")
-
-        # 試兩種 URL 格式
-        urls = [
-            f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL",
-            f"https://www.twse.com.tw/fund/T86?response=json&date={d}&selectType=ALL",
-        ]
-        data = None
-        for url in urls:
-            data = twse_get(url)
-            if data and data.get("stat") == "OK":
-                break
+        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL"
+        data = twse_get(url)
 
         if not data or data.get("stat") != "OK":
             continue
@@ -1287,22 +1252,22 @@ async def get_foreign_rank(x_token: str = Header(default=None)):
         if not rows:
             continue
 
-        def fi(name, default):
-            try: return fields.index(name)
-            except ValueError: return default
+        # 實際欄位名稱：外陸資買進股數(不含外資自營商)
+        def fi(candidates, default):
+            for name in candidates:
+                if name in fields:
+                    return fields.index(name)
+            return default
 
-        # T86 可能的欄位名稱
-        idx_code  = fi("證券代號", 0)
-        idx_name  = fi("證券名稱", 1)
-        # 外資欄位有多種可能名稱
-        idx_fbuy  = fi("外陸資買進股數", fi("外資及陸資買進股數", 2))
-        idx_fsell = fi("外陸資賣出股數", fi("外資及陸資賣出股數", 3))
-        idx_fnet  = fi("外陸資淨買賣超股數", fi("外資及陸資淨買賣超股數", 4))
+        idx_code  = fi(["證券代號"], 0)
+        idx_name  = fi(["證券名稱"], 1)
+        idx_fbuy  = fi(["外陸資買進股數(不含外資自營商)", "外陸資買進股數", "外資及陸資買進股數"], 2)
+        idx_fsell = fi(["外陸資賣出股數(不含外資自營商)", "外陸資賣出股數", "外資及陸資賣出股數"], 3)
+        idx_fnet  = fi(["外陸資買賣超股數(不含外資自營商)", "外陸資買賣超股數", "外資及陸資淨買賣超股數"], 4)
 
         def parse_num(s):
             try:
-                v = int(str(s).replace(",", "").replace(" ", ""))
-                return v // 1000  # 轉換為張
+                return int(str(s).replace(",", "").replace(" ", "")) // 1000
             except Exception:
                 return 0
 
