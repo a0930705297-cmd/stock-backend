@@ -1265,6 +1265,24 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
 
     history_rows = sorted(hist_map.values(), key=lambda x: x["date"])
 
+    # ── 優先用 FinMind 最新一筆當作今日籌碼 ──────
+    # T86 永遠落後一天，FinMind 當日盤後即更新，以 FinMind 為主
+    latest_inst_date = ""
+    if history_rows:
+        latest_hist = history_rows[-1]
+        latest_inst_date = latest_hist["date"]
+        institutional = {
+            "foreign_net":       latest_hist.get("foreign_net", 0),
+            "foreign_buy":       0,
+            "foreign_sell":      0,
+            "invest_trust_net":  latest_hist.get("invest_trust_net", 0),
+            "invest_trust_buy":  0,
+            "invest_trust_sell": 0,
+            "dealer_net":        latest_hist.get("dealer_net", 0),
+            "dealer_buy":        0,
+            "dealer_sell":       0,
+        }
+
     # ── 3. 融資融券（FinMind）────────────────────
     margin_rows_raw = finmind_get("TaiwanStockMarginPurchaseShortSale", symbol, start_10, end_date)
     margin_history = []
@@ -1335,6 +1353,6 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
         "data":           data_out,
         "history":        history_rows,
         "margin_history": margin_history[-10:],
-        "source":         "twse",
-        "date":           end_date,
+        "source":         "finmind",
+        "date":           latest_inst_date or end_date,
     }
