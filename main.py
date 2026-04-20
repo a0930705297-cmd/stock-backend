@@ -1306,6 +1306,173 @@ async def get_foreign_rank(x_token: str = Header(default=None)):
         "error": "無法取得資料（請確認為交易日）"
     }
 
+
+# ── /chips/{symbol} 籌碼分析 API ─────────────
+@app.get("/chips/{symbol}")
+async def get_chips(symbol: str, x_token: str = Header(default=None)):
+    """
+    整合當日三大法人、融資融券、借券、當沖等籌碼資料
+    """
+    verify_token(x_token)
+    today = datetime.today()
+
+    # ── 1. 三大法人（TWSE T86，最近交易日）───────
+    institutional = {}
+    history_rows = []
+    for i in range(1, 8):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL"
+        data = twse_get(url)
+        if not data or data.get("stat") != "OK":
+            continue
+        fields = data.get("fields", [])
+        rows   = data.get("data", [])
+
+        def fi(candidates, default):
+            for name in candidates:
+                if name in fields:
+                    return fields.index(name)
+            return default
+
+        idx_code   = fi(["證券代號"], 0)
+        idx_name   = fi(["證券名稱"], 1)
+        idx_fbuy   = fi(["外陸資買進股數(不含外資自營商)", "外陸資買進股數"], 2)
+        idx_fsell  = fi(["外陸資賣出股數(不含外資自營商)", "外陸資賣出股數"], 3)
+        idx_fnet   = fi(["外陸資買賣超股數(不含外資自營商)", "外陸資買賣超股數"], 4)
+        idx_itbuy  = fi(["投信買進股數"], 8)
+        idx_itsell = fi(["投信賣出股數"], 9)
+        idx_itnet  = fi(["投信買賣超股數"], 10)
+        idx_dbuy   = fi(["自營商買進股數(自行買賣)", "自營商買進股數"], 12)
+        idx_dsell  = fi(["自營商賣出股數(自行買賣)", "自營商賣出股數"], 13)
+        idx_dnet   = fi(["自營商買賣超股數(自行買賣)", "自營商買賣超股數"], 11)
+
+        def pn(s):
+            try: return int(str(s).replace(",","").strip()) // 1000
+            except: return 0
+
+        for row in rows:
+            try:
+                if str(row[idx_code]).strip() != symbol:
+                    continue
+                institutional = {
+                    "foreign_net":      pn(row[idx_fnet]),
+                    "foreign_buy":      pn(row[idx_fbuy]),
+                    "foreign_sell":     pn(row[idx_fsell]),
+                    "invest_trust_net": pn(row[idx_itnet]),
+                    "invest_trust_buy": pn(row[idx_itbuy]),
+                    "invest_trust_sell":pn(row[idx_itsell]),
+                    "dealer_net":       pn(row[idx_dnet]),
+                    "dealer_buy":       pn(row[idx_dbuy]),
+                    "dealer_sell":      pn(row[idx_dsell]),
+                }
+                break
+            except Exception:
+                continue
+        if institutional:
+            break
+
+    # ── 2. 近10日三大法人歷史（FinMind）──────────
+    start_10 = (today - timedelta(days=20)).strftime("%Y-%m-%d")
+    end_date  = today.strftime("%Y-%m-%d")
+    inst_rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", symbol, start_10, end_date)
+    hist_map = {}
+    for r in inst_rows:
+        date_key = r["date"]
+        if date_key not in hist_map:
+            hist_map[date_key] = {"date": date_key, "foreign_net": 0, "invest_trust_net": 0, "dealer_net": 0}
+        buy  = max(int(r.get("buy",  0)), 0) // 1000
+        sell = max(int(r.get("sell", 0)), 0) // 1000
+        net  = buy - sell
+        name = r.get("name", "")
+        if name == "Foreign_Investor":
+            hist_map[date_key]["foreign_net"] = net
+        elif name == "Investment_Trust":
+            hist_map[date_key]["invest_trust_net"] = net
+        elif name == "Dealer_self":
+            hist_map[date_key]["dealer_net"] = net
+
+    # ── 加上收盤價 ──────────────────────────────
+    price_rows = finmind_get("TaiwanStockPrice", symbol, start_10, end_date)
+    price_map = {r["date"]: float(r.get("close", 0)) for r in price_rows}
+    for date_key, row in hist_map.items():
+        row["close"] = price_map.get(date_key, 0)
+
+    history_rows = sorted(hist_map.values(), key=lambda x: x["date"])
+
+    # ── 3. 融資融券（FinMind）────────────────────
+    margin_rows_raw = finmind_get("TaiwanStockMarginPurchaseShortSale", symbol, start_10, end_date)
+    margin_history = []
+    for r in margin_rows_raw:
+        mb  = int(r.get("MarginPurchaseTodayBalance", 0))
+        mb_prev = int(r.get("MarginPurchaseYesterdayBalance", 0))
+        sb  = int(r.get("ShortSaleTodayBalance", 0))
+        sb_prev = int(r.get("ShortSaleYesterdayBalance", 0))
+        margin_history.append({
+            "date":           r["date"],
+            "margin_balance": mb,
+            "margin_change":  mb - mb_prev,
+            "short_balance":  sb,
+            "short_change":   sb - sb_prev,
+            "short_margin_ratio": round(sb / mb * 100, 2) if mb > 0 else 0,
+        })
+    margin_history.sort(key=lambda x: x["date"])
+    latest_margin = margin_history[-1] if margin_history else {}
+
+    # ── 4. 當日股價與成交量（FinMind）─────────────
+    price_today_rows = finmind_get("TaiwanStockPrice", symbol,
+                                   (today - timedelta(days=5)).strftime("%Y-%m-%d"),
+                                   end_date)
+    latest_price_row = price_today_rows[-1] if price_today_rows else {}
+    latest_price  = float(latest_price_row.get("close", 0))
+    latest_volume = int(latest_price_row.get("Trading_Volume", 0)) // 1000
+
+    # ── 5. 當沖率（TWSE）──────────────────────────
+    day_trade_vol   = 0
+    day_trade_ratio = 0.0
+    for i in range(1, 6):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+        dt_url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date={d}&stockNo={symbol}&response=json"
+        dt_data = twse_get(dt_url)
+        if dt_data and dt_data.get("stat") == "OK" and dt_data.get("data"):
+            last = dt_data["data"][-1]
+            try:
+                day_trade_vol = int(str(last[2]).replace(",","")) // 1000
+                vol_total     = int(str(last[1]).replace(",","")) // 1000
+                day_trade_ratio = round(day_trade_vol / vol_total * 100, 2) if vol_total > 0 else 0
+            except Exception:
+                pass
+            break
+
+    # ── 組合今日籌碼 ─────────────────────────────
+    data_out = {
+        **institutional,
+        "price":           latest_price,
+        "volume":          latest_volume,
+        "margin_balance":  latest_margin.get("margin_balance", 0),
+        "margin_change":   latest_margin.get("margin_change", 0),
+        "short_balance":   latest_margin.get("short_balance", 0),
+        "short_change":    latest_margin.get("short_change", 0),
+        "short_margin_ratio": latest_margin.get("short_margin_ratio", 0),
+        "day_trade_volume": day_trade_vol,
+        "day_trade_ratio":  day_trade_ratio,
+        # 主力 = 外資+投信（簡化）
+        "main_net": (institutional.get("foreign_net", 0) + institutional.get("invest_trust_net", 0)),
+        # 三大法人合計
+        "institutional_total": (
+            institutional.get("foreign_net", 0) +
+            institutional.get("invest_trust_net", 0) +
+            institutional.get("dealer_net", 0)
+        ),
+    }
+
+    return {
+        "data":           data_out,
+        "history":        history_rows,
+        "margin_history": margin_history[-10:],
+        "source":         "twse",
+        "date":           end_date,
+    }
+    
 # ── 2. 產業輪動統計 ──────────────────────────
 @app.post("/sector_rotation")
 async def get_sector_rotation(body: dict, x_token: str = Header(default=None)):
