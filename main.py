@@ -1288,22 +1288,35 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
 
     history_rows = sorted(hist_map.values(), key=lambda x: x["date"])
 
-    # ── 優先用 FinMind 最新一筆當作今日籌碼 ──────
-    # T86 永遠落後一天，FinMind 當日盤後即更新，以 FinMind 為主
+    # ── 優先用 FinMind 最新一筆的 net，buy/sell 保留 T86 ──
+    # FinMind 只有 net，T86 有 buy/sell/net
+    # 策略：若 FinMind 最新日期 >= T86 日期，用 FinMind net 覆蓋 net，buy/sell 保留 T86
     latest_inst_date = ""
     if history_rows:
-        latest_hist = history_rows[-1]
+        latest_hist      = history_rows[-1]
         latest_inst_date = latest_hist["date"]
+        fm_date_str      = latest_inst_date.replace("-", "")
+
+        # 取 T86 的 buy/sell（若有的話）
+        t86_fbuy  = institutional.get("foreign_buy",       0)
+        t86_fsell = institutional.get("foreign_sell",      0)
+        t86_itbuy = institutional.get("invest_trust_buy",  0)
+        t86_itsell= institutional.get("invest_trust_sell", 0)
+        t86_dbuy  = institutional.get("dealer_buy",        0)
+        t86_dsell = institutional.get("dealer_sell",       0)
+
         institutional = {
-            "foreign_net":       latest_hist.get("foreign_net", 0),
-            "foreign_buy":       0,
-            "foreign_sell":      0,
-            "invest_trust_net":  latest_hist.get("invest_trust_net", 0),
-            "invest_trust_buy":  0,
-            "invest_trust_sell": 0,
-            "dealer_net":        latest_hist.get("dealer_net", 0),
-            "dealer_buy":        0,
-            "dealer_sell":       0,
+            # net 優先用 FinMind（較新）
+            "foreign_net":       latest_hist.get("foreign_net", institutional.get("foreign_net", 0)),
+            "invest_trust_net":  latest_hist.get("invest_trust_net", institutional.get("invest_trust_net", 0)),
+            "dealer_net":        latest_hist.get("dealer_net", institutional.get("dealer_net", 0)),
+            # buy/sell 保留 T86 的值（FinMind 歷史沒有拆分）
+            "foreign_buy":       t86_fbuy,
+            "foreign_sell":      t86_fsell,
+            "invest_trust_buy":  t86_itbuy,
+            "invest_trust_sell": t86_itsell,
+            "dealer_buy":        t86_dbuy,
+            "dealer_sell":       t86_dsell,
         }
 
     # ── 3. 融資融券（FinMind）────────────────────
