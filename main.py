@@ -253,6 +253,29 @@ async def get_foreign(symbol: str, x_token: str = Header(default=None)):
     result.sort(key=lambda x: x["date"])
     return {"data": result}
 
+@app.get("/invest_trust/{symbol}")
+async def get_invest_trust(symbol: str, x_token: str = Header(default=None)):
+    """投信買賣超，格式與 /foreign 相同，供前端計算投信加權成本"""
+    verify_token(x_token)
+    today = datetime.today()
+    start = (today - timedelta(days=730)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", symbol, start, end)
+    result = []
+    for row in rows:
+        if row.get("name") != "Investment_Trust":
+            continue
+        buy = max(int(row.get("buy", 0)), 0) // 1000
+        sell = max(int(row.get("sell", 0)), 0) // 1000
+        result.append({
+            "date": row["date"].replace("-", ""),
+            "buy": buy,
+            "sell": sell,
+            "net": buy - sell
+        })
+    result.sort(key=lambda x: x["date"])
+    return {"data": result}
+
 @app.get("/margin/{symbol}")
 async def get_margin(symbol: str, x_token: str = Header(default=None)):
     verify_token(x_token)
