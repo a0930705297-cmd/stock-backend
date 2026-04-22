@@ -1397,139 +1397,92 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
 
 @app.get("/chip_scan")
 async def chip_scan(
-    days: int = 1,
-    min_foreign: int = 0,
+    codes: str = "",          # 前端傳入逗號分隔的股票代號清單
+    min_foreign: int = 0,     # 外資最低買超張數
     x_token: str = Header(default=None)
 ):
     verify_token(x_token)
     today = datetime.today()
 
-    # ① 用 TWSE T86 一次抓全市場三大法人（外資＋投信＋自營）
+    # 解析傳入的股票代號
+    code_list = [c.strip() for c in codes.split(",") if c.strip().isdigit()]
+    if not code_list:
+        return {"data": [], "error": "請提供股票代號", "scan_date": ""}
+
+    # 找最近有效交易日
     scan_date = None
-    all_chip = {}   # code -> {name, foreign_net, trust_net, close}
-
     for i in range(7):
-        try_dt = today - timedelta(days=i)
-        # 跳過週末
-        if try_dt.weekday() >= 5:
+        d = today - timedelta(days=i)
+        if d.weekday() >= 5:
             continue
-        date_str = try_dt.strftime("%Y%m%d")
-        url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
-               f"?date={date_str}&selectType=ALL&response=json")
-        data = twse_get(url)
-        if not data or data.get("stat") != "OK":
-            continue
-        rows = data.get("data", [])
-        if not rows:
-            continue
-
-        scan_date = try_dt.strftime("%Y-%m-%d")
-        for row in rows:
-            try:
-                code = str(row[0]).strip()
-                name = str(row[1]).strip()
-                if not code.isdigit():
-                    continue
-                # 外資買賣超（欄位4）、投信買賣超（欄位7）
-                foreign_net = int(str(row[4]).replace(",", "").replace("+", "")) // 1000
-                trust_net   = int(str(row[7]).replace(",", "").replace("+", "")) // 1000
-                all_chip[code] = {
-                    "name": name,
-                    "foreign_net": foreign_net,
-                    "trust_net": trust_net,
-                    "close": 0
-                }
-            except Exception:
-                continue
+        scan_date = d.strftime("%Y-%m-%d")
         break
 
     if not scan_date:
-        return {"data": [], "error": "無法取得 TWSE 三大法人資料", "scan_date": ""}
+        return {"data": [], "error": "無法判斷交易日", "scan_date": ""}
 
-    # ② 連續買超（days > 1）：用前幾天的 T86 交叉比對
-    confirmed_codes = set()
-    if days <= 1:
-        # 單日：直接用今天結果
-        confirmed_codes = {
-            code for code, v in all_chip.items()
-            if v["foreign_net"] > min_foreign and v["trust_net"] > 0
-        }
-    else:
-        # 多日：收集前 days 天每天外資＋投信都買超的股票
-        daily_buyers = []  # list of set(codes)
-        found_days = 0
-        for i in range(14):
-            if found_days >= days:
-                break
-            try_dt = today - timedelta(days=i)
-            if try_dt.weekday() >= 5:
-                continue
-            date_str = try_dt.strftime("%Y%m%d")
-            url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
-                   f"?date={date_str}&selectType=ALL&response=json")
-            data = twse_get(url)
-            if not data or data.get("stat") != "OK" or not data.get("data"):
-                continue
-            day_set = set()
-            for row in data["data"]:
-                try:
-                    code = str(row[0]).strip()
-                    if not code.isdigit():
-                        continue
-                    f_net = int(str(row[4]).replace(",","").replace("+","")) // 1000
-                    t_net = int(str(row[7]).replace(",","").replace("+","")) // 1000
-                    if f_net > min_foreign and t_net > 0:
-                        day_set.add(code)
-                except Exception:
-                    continue
-            daily_buyers.append(day_set)
-            found_days += 1
-
-        if daily_buyers:
-            confirmed_codes = daily_buyers[0]
-            for s in daily_buyers[1:]:
-                confirmed_codes &= s  # 取交集：每天都買超
-
-    # ③ 補收盤價（用 TWSE MI_INDEX20）
-    for i in range(5):
-        try_dt = today - timedelta(days=i)
-        if try_dt.weekday() >= 5:
-            continue
-        date_str = try_dt.strftime("%Y%m%d")
-        url = (f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20"
-               f"?date={date_str}&response=json")
-        price_data = twse_get(url)
-        if price_data and price_data.get("stat") == "OK" and price_data.get("data"):
-            for row in price_data["data"]:
-                try:
-                    code = str(row[1]).strip()
-                    close = float(str(row[8]).replace(",", ""))
-                    if code in all_chip:
-                        all_chip[code]["close"] = close
-                except Exception:
-                    continue
-            break
-
-    # ④ 組裝結果
     results = []
-    for code in confirmed_codes:
-        v = all_chip.get(code)
-        if not v:
+    for code in code_list[:60]:   # 最多60支，控制 API 次數
+        try:
+            rows = finmind_get(
+                "TaiwanStockInstitutionalInvestorsBuySell",
+                code, scan_date, scan_date
+            )
+            if not rows:
+                continue
+
+            foreign_buy = foreign_sell = trust_buy = trust_sell = 0
+            stock_name = code
+            for row in rows:
+                name_type = row.get("name", "")
+                buy  = int(row.get("buy",  0))
+                sell = int(row.get("sell", 0))
+                if name_type == "Foreign_Investor":
+                    foreign_buy  = buy // 1000
+                    foreign_sell = sell // 1000
+                elif name_type == "Investment_Trust":
+                    trust_buy  = buy // 1000
+                    trust_sell = sell // 1000
+
+            foreign_net = foreign_buy - foreign_sell
+            trust_net   = trust_buy  - trust_sell
+
+            # 雙買超篩選
+            if foreign_net <= min_foreign or trust_net <= 0:
+                continue
+
+            # 抓股票名稱（從 ticker）
+            try:
+                ticker_rows = finmind_get("TaiwanStockInfo", code,
+                                          "2020-01-01", scan_date)
+                if ticker_rows:
+                    stock_name = ticker_rows[-1].get("stock_name", code)
+            except Exception:
+                pass
+
+            # 抓最新收盤價
+            price_rows = finmind_get("TaiwanStockPrice", code,
+                                     scan_date, scan_date)
+            close = 0
+            if price_rows:
+                close = float(price_rows[-1].get("close", 0))
+
+            results.append({
+                "code": code,
+                "name": stock_name,
+                "close": close,
+                "foreign_net": foreign_net,
+                "trust_net":   trust_net,
+                "total_net":   foreign_net + trust_net,
+            })
+
+        except Exception:
             continue
-        results.append({
-            "code": code,
-            "name": v["name"],
-            "close": v["close"],
-            "foreign_net": v["foreign_net"],
-            "trust_net":   v["trust_net"],
-            "total_net":   v["foreign_net"] + v["trust_net"],
-        })
 
     results.sort(key=lambda x: -x["foreign_net"])
-    label = f"連續{days}日" if days > 1 else "當日"
     return {
         "data": results,
         "scan_date": scan_date,
         "total": len(results),
-        "note": f"{label}外資＋投信雙買超共 {len(results)} 支（{scan_date}）"
+        "note": f"共 {len(results)} 支雙買超，掃描 {len(code_list)} 支（{scan_date}）"
     }
