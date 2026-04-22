@@ -1392,3 +1392,89 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
         "source":         "finmind",
         "date":           latest_inst_date or end_date,
     }
+
+
+@app.get("/chip_scan")
+async def chip_scan(
+    codes: str = "",
+    min_foreign: int = 0,
+    x_token: str = Header(default=None)
+):
+    verify_token(x_token)
+    today = datetime.today()
+
+    code_list = [c.strip() for c in codes.split(",") if c.strip().isdigit()]
+    if not code_list:
+        return {"data": [], "error": "請提供股票代號", "scan_date": ""}
+
+    scan_date = None
+    for i in range(7):
+        d = today - timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        scan_date = d.strftime("%Y-%m-%d")
+        break
+
+    if not scan_date:
+        return {"data": [], "error": "無法判斷交易日", "scan_date": ""}
+
+    results = []
+    for code in code_list[:60]:
+        try:
+            rows = finmind_get(
+                "TaiwanStockInstitutionalInvestorsBuySell",
+                code, scan_date, scan_date
+            )
+            if not rows:
+                continue
+
+            foreign_buy = foreign_sell = trust_buy = trust_sell = 0
+            stock_name = code
+            for row in rows:
+                name_type = row.get("name", "")
+                buy = int(row.get("buy", 0))
+                sell = int(row.get("sell", 0))
+                if name_type == "Foreign_Investor":
+                    foreign_buy = buy // 1000
+                    foreign_sell = sell // 1000
+                elif name_type == "Investment_Trust":
+                    trust_buy = buy // 1000
+                    trust_sell = sell // 1000
+
+            foreign_net = foreign_buy - foreign_sell
+            trust_net = trust_buy - trust_sell
+
+            if foreign_net <= min_foreign or trust_net <= 0:
+                continue
+
+            try:
+                ticker_rows = finmind_get("TaiwanStockInfo", code, "2020-01-01", scan_date)
+                if ticker_rows:
+                    stock_name = ticker_rows[-1].get("stock_name", code)
+            except Exception:
+                pass
+
+            price_rows = finmind_get("TaiwanStockPrice", code, scan_date, scan_date)
+            close = 0
+            if price_rows:
+                close = float(price_rows[-1].get("close", 0))
+
+            results.append({
+                "code": code,
+                "name": stock_name,
+                "close": close,
+                "foreign_net": foreign_net,
+                "trust_net": trust_net,
+                "total_net": foreign_net + trust_net,
+            })
+
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: -x["foreign_net"])
+    return {
+        "data": results,
+        "scan_date": scan_date,
+        "total": len(results),
+        "note": f"共 {len(results)} 支雙買超，掃描 {len(code_list)} 支（{scan_date}）"
+    }
