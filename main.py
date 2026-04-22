@@ -1394,140 +1394,142 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     }
 
 # ── 籌碼掃描：外資＋投信雙買超 ─────────────────────────────
-def finmind_get_all(dataset: str, date: str):
-    """不帶 stock_id，一次抓全市場單日資料"""
-    url = (
-        f"https://api.finmindtrade.com/api/v4/data"
-        f"?dataset={dataset}&start_date={date}&end_date={date}"
-        f"&token={FINMIND_TOKEN}"
-    )
-    data = twse_get(url)
-    if not data or data.get("msg") != "success":
-        return []
-    return data.get("data", [])
-
 
 @app.get("/chip_scan")
 async def chip_scan(
-    days: int = 1,          # 連續買超天數門檻（預設1天）
-    min_foreign: int = 0,   # 外資最低買超張數
+    days: int = 1,
+    min_foreign: int = 0,
     x_token: str = Header(default=None)
 ):
     verify_token(x_token)
-
     today = datetime.today()
 
-    # ① 找最近有效交易日（最多往回找5天）
+    # ① 用 TWSE T86 一次抓全市場三大法人（外資＋投信＋自營）
     scan_date = None
-    for i in range(5):
-        try_date = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-        test = finmind_get_all("TaiwanStockInstitutionalInvestorsBuySell", try_date)
-        if test:
-            scan_date = try_date
-            all_chip_rows = test
-            break
+    all_chip = {}   # code -> {name, foreign_net, trust_net, close}
+
+    for i in range(7):
+        try_dt = today - timedelta(days=i)
+        # 跳過週末
+        if try_dt.weekday() >= 5:
+            continue
+        date_str = try_dt.strftime("%Y%m%d")
+        url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
+               f"?date={date_str}&selectType=ALL&response=json")
+        data = twse_get(url)
+        if not data or data.get("stat") != "OK":
+            continue
+        rows = data.get("data", [])
+        if not rows:
+            continue
+
+        scan_date = try_dt.strftime("%Y-%m-%d")
+        for row in rows:
+            try:
+                code = str(row[0]).strip()
+                name = str(row[1]).strip()
+                if not code.isdigit():
+                    continue
+                # 外資買賣超（欄位4）、投信買賣超（欄位7）
+                foreign_net = int(str(row[4]).replace(",", "").replace("+", "")) // 1000
+                trust_net   = int(str(row[7]).replace(",", "").replace("+", "")) // 1000
+                all_chip[code] = {
+                    "name": name,
+                    "foreign_net": foreign_net,
+                    "trust_net": trust_net,
+                    "close": 0
+                }
+            except Exception:
+                continue
+        break
 
     if not scan_date:
-        return {"data": [], "error": "無法取得三大法人資料", "scan_date": ""}
+        return {"data": [], "error": "無法取得 TWSE 三大法人資料", "scan_date": ""}
 
-    # ② 整理當日法人資料：依股票代號分組
-    chip_map = {}  # code -> {foreign_net, trust_net}
-    for row in all_chip_rows:
-        code = row.get("stock_id", "")
-        name_type = row.get("name", "")
-        buy = max(int(row.get("buy", 0)), 0) // 1000
-        sell = max(int(row.get("sell", 0)), 0) // 1000
-        net = buy - sell
-        if code not in chip_map:
-            chip_map[code] = {"foreign_net": 0, "trust_net": 0,
-                              "foreign_buy": 0, "trust_buy": 0}
-        if name_type == "Foreign_Investor":
-            chip_map[code]["foreign_net"] = net
-            chip_map[code]["foreign_buy"] = buy
-        elif name_type == "Investment_Trust":
-            chip_map[code]["trust_net"] = net
-            chip_map[code]["trust_buy"] = buy
-
-    # ③ 篩選雙買超
-    double_buy = {
-        code: v for code, v in chip_map.items()
-        if v["foreign_net"] > min_foreign and v["trust_net"] > 0
-    }
-
-    if not double_buy:
-        return {"data": [], "scan_date": scan_date,
-                "note": "當日無外資＋投信雙買超標的"}
-
-    # ④ 連續買超篩選（days > 1 才需要）
-    if days > 1:
-        start_multi = (today - timedelta(days=days * 2 + 5)).strftime("%Y-%m-%d")
-        end_multi = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-        confirmed = {}
-        for code in double_buy:
-            rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell",
-                               code, start_multi, end_multi)
-            # 找最近 days-1 天外資都買超
-            dates_foreign_buy = sorted(set(
-                r["date"] for r in rows
-                if r.get("name") == "Foreign_Investor"
-                and (int(r.get("buy", 0)) // 1000 - int(r.get("sell", 0)) // 1000) > 0
-            ))
-            if len(dates_foreign_buy) >= days - 1:
-                confirmed[code] = double_buy[code]
-        double_buy = confirmed
-
-    # ⑤ 抓股票名稱 + 當日收盤價（用 TWSE market_volume 資料）
-    name_price_map = {}
-    for i in range(5):
-        try_date_twse = (today - timedelta(days=i)).strftime("%Y%m%d")
-        url_twse = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20?date={try_date_twse}&response=json"
-        twse_data = twse_get(url_twse)
-        if twse_data and twse_data.get("stat") == "OK" and twse_data.get("data"):
-            for row in twse_data["data"]:
+    # ② 連續買超（days > 1）：用前幾天的 T86 交叉比對
+    confirmed_codes = set()
+    if days <= 1:
+        # 單日：直接用今天結果
+        confirmed_codes = {
+            code for code, v in all_chip.items()
+            if v["foreign_net"] > min_foreign and v["trust_net"] > 0
+        }
+    else:
+        # 多日：收集前 days 天每天外資＋投信都買超的股票
+        daily_buyers = []  # list of set(codes)
+        found_days = 0
+        for i in range(14):
+            if found_days >= days:
+                break
+            try_dt = today - timedelta(days=i)
+            if try_dt.weekday() >= 5:
+                continue
+            date_str = try_dt.strftime("%Y%m%d")
+            url = (f"https://www.twse.com.tw/rwd/zh/fund/T86"
+                   f"?date={date_str}&selectType=ALL&response=json")
+            data = twse_get(url)
+            if not data or data.get("stat") != "OK" or not data.get("data"):
+                continue
+            day_set = set()
+            for row in data["data"]:
                 try:
-                    c = str(row[1]).strip()
-                    n = str(row[2]).strip()
-                    p = float(str(row[8]).replace(",", "")) if row[8] else 0
-                    if p > 0:
-                        name_price_map[c] = {"name": n, "close": p}
+                    code = str(row[0]).strip()
+                    if not code.isdigit():
+                        continue
+                    f_net = int(str(row[4]).replace(",","").replace("+","")) // 1000
+                    t_net = int(str(row[7]).replace(",","").replace("+","")) // 1000
+                    if f_net > min_foreign and t_net > 0:
+                        day_set.add(code)
+                except Exception:
+                    continue
+            daily_buyers.append(day_set)
+            found_days += 1
+
+        if daily_buyers:
+            confirmed_codes = daily_buyers[0]
+            for s in daily_buyers[1:]:
+                confirmed_codes &= s  # 取交集：每天都買超
+
+    # ③ 補收盤價（用 TWSE MI_INDEX20）
+    for i in range(5):
+        try_dt = today - timedelta(days=i)
+        if try_dt.weekday() >= 5:
+            continue
+        date_str = try_dt.strftime("%Y%m%d")
+        url = (f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20"
+               f"?date={date_str}&response=json")
+        price_data = twse_get(url)
+        if price_data and price_data.get("stat") == "OK" and price_data.get("data"):
+            for row in price_data["data"]:
+                try:
+                    code = str(row[1]).strip()
+                    close = float(str(row[8]).replace(",", ""))
+                    if code in all_chip:
+                        all_chip[code]["close"] = close
                 except Exception:
                     continue
             break
 
-    # ⑥ 補抓股票名稱（TWSE 沒有的用 FinMind TaiwanStockInfo）
-    missing_codes = [c for c in double_buy if c not in name_price_map]
-    if missing_codes:
-        info_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
-        info_data = twse_get(info_url)
-        if info_data and info_data.get("msg") == "success":
-            for row in info_data.get("data", []):
-                sid = row.get("stock_id", "")
-                if sid in missing_codes:
-                    name_price_map[sid] = {
-                        "name": row.get("stock_name", sid),
-                        "close": 0
-                    }
-
-    # ⑦ 組裝結果
+    # ④ 組裝結果
     results = []
-    for code, chip in double_buy.items():
-        info = name_price_map.get(code, {"name": code, "close": 0})
-        close = info["close"]
+    for code in confirmed_codes:
+        v = all_chip.get(code)
+        if not v:
+            continue
         results.append({
             "code": code,
-            "name": info["name"],
-            "close": close,
-            "foreign_net": chip["foreign_net"],   # 外資買超張數
-            "trust_net": chip["trust_net"],         # 投信買超張數
-            "total_net": chip["foreign_net"] + chip["trust_net"],
+            "name": v["name"],
+            "close": v["close"],
+            "foreign_net": v["foreign_net"],
+            "trust_net":   v["trust_net"],
+            "total_net":   v["foreign_net"] + v["trust_net"],
         })
 
-    # 依外資買超張數排序
     results.sort(key=lambda x: -x["foreign_net"])
-
+    label = f"連續{days}日" if days > 1 else "當日"
     return {
         "data": results,
         "scan_date": scan_date,
         "total": len(results),
-        "note": f"共 {len(results)} 支外資＋投信雙買超（{scan_date}）"
+        "note": f"{label}外資＋投信雙買超共 {len(results)} 支（{scan_date}）"
     }
