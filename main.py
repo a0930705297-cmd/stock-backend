@@ -1564,11 +1564,11 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     主要資料來源：
     - intraday/trades?limit=500&sort=asc → 最新成交價 + Tick Rule 推估近30筆
     - intraday/volumes → volumeAtAsk / volumeAtBid 分價量表加總（全日精確）
-    - intraday/quote   → 只有完全沒有逐筆資料時，才用 lastPrice fallback
+    - intraday/quote   → 只有完全沒有逐筆資料時，才用價格欄位 fallback
 
     latest_price 來源優先順序：
       1. detail[-1]['price']（sort=asc 後的今日最後一筆成交價）
-      2. quote.lastPrice（無逐筆資料時 fallback）
+      2. quote 的 lastPrice / closePrice / price（無逐筆資料時 fallback）
     """
     verify_token(x_token)
 
@@ -1647,7 +1647,12 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
                 )
             quote_raw = quote_res.json()
             quote_data = quote_raw.get("data", {}) or {}
-            latest_price = _tick_float(quote_data.get("lastPrice")) or None
+            latest_price = (
+                _tick_float(quote_data.get("lastPrice")) or
+                _tick_float(quote_data.get("closePrice")) or
+                _tick_float(quote_data.get("price")) or
+                None
+            )
         except Exception:
             latest_price = None
 
