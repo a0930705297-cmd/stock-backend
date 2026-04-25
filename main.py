@@ -4,7 +4,7 @@ import warnings
 import os
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 import yfinance as yf
 import asyncio
@@ -1482,7 +1482,7 @@ async def chip_scan(
 
 
 # ════════════════════════════════════════════════════════════════
-#  即時內外盤比 v3
+#  即時內外盤比 v4
 #  最新成交價：intraday/quote lastPrice（唯一可靠來源）
 #  全日外盤/內盤：intraday/volumes 分價量表逐列加總
 #  近30筆滾動：intraday/trades Tick Rule 推估
@@ -1490,23 +1490,63 @@ async def chip_scan(
 
 _tick_cache: dict = {}
 _TICK_CACHE_SEC = 12
+_TW_TZ = timezone(timedelta(hours=8))
+
+def _tick_float(v, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        s = str(v).replace(",", "").strip()
+        if s in ("", "-", "--", "None", "null", "nan"):
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def _tick_int(v, default: int = 0) -> int:
+    return int(_tick_float(v, float(default)))
 
 def _fmt_time(t) -> str:
     """Fugle time 欄位 → HH:MM:SS"""
     if t is None:
         return "—"
+
+    def _from_unix(value) -> str | None:
+        try:
+            seconds = float(value)
+        except Exception:
+            return None
+
+        # Fugle may return epoch timestamps in seconds, ms, us, or ns.
+        magnitude = abs(seconds)
+        if magnitude >= 1e17:
+            seconds /= 1_000_000_000
+        elif magnitude >= 1e14:
+            seconds /= 1_000_000
+        elif magnitude >= 1e11:
+            seconds /= 1_000
+
+        try:
+            return datetime.fromtimestamp(seconds, _TW_TZ).strftime("%H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            return None
+
     if isinstance(t, (int, float)):
-        return datetime.fromtimestamp(t).strftime("%H:%M:%S")
-    s = str(t)
+        return _from_unix(t) or str(t)[:8]
+
+    s = str(t).strip()
+    if not s:
+        return "—"
     if "T" in s:
         try:
             return s.split("T")[1][:8]
         except Exception:
             pass
-    try:
-        return datetime.fromtimestamp(float(s)).strftime("%H:%M:%S")
-    except Exception:
-        return s[:8] if len(s) >= 8 else s
+    if len(s) >= 8 and s[2] == ":" and s[5] == ":":
+        return s[:8]
+
+    parsed = _from_unix(s)
+    return parsed or (s[:8] if len(s) >= 8 else s)
 
 def _tick_err(symbol, msg):
     return {
@@ -1519,7 +1559,7 @@ def _tick_err(symbol, msg):
 @app.get("/tick_ratio/{symbol}")
 async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     """
-    即時內外盤比 v3
+    即時內外盤比 v4
 
     三支 API 同時打：
     - intraday/quote   → lastPrice（最新成交價，唯一可靠來源）
@@ -1556,17 +1596,17 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
 
     # ── 最新成交價：quote.lastPrice ───────────────────────────────
     quote_data  = quote_raw.get("data", {}) or {}
-    latest_price = float(quote_data.get("lastPrice", 0) or 0) or None
+    latest_price = _tick_float(quote_data.get("lastPrice")) or None
 
     # ── 全日：volumes 分價量表，逐列加總 ──────────────────────────
     vol_data = vol_raw.get("data", [])
     if isinstance(vol_data, list) and vol_data:
-        outer_day = sum(int(row.get("volumeAtAsk", 0) or 0) for row in vol_data)
-        inner_day = sum(int(row.get("volumeAtBid", 0) or 0) for row in vol_data)
+        outer_day = sum(_tick_int(row.get("volumeAtAsk")) for row in vol_data)
+        inner_day = sum(_tick_int(row.get("volumeAtBid")) for row in vol_data)
     elif isinstance(vol_data, dict):
         # 防禦：萬一 API 回傳單一 dict
-        outer_day = int(vol_data.get("volumeAtAsk", 0) or 0)
-        inner_day = int(vol_data.get("volumeAtBid", 0) or 0)
+        outer_day = _tick_int(vol_data.get("volumeAtAsk"))
+        inner_day = _tick_int(vol_data.get("volumeAtBid"))
     else:
         outer_day = inner_day = 0
 
@@ -1580,9 +1620,12 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     last_side = "outer"
 
     for t in trades_list:
-        price = float(t.get("price", 0) or 0)
-        size  = int(t.get("size",  0) or 0)
-        t_str = _fmt_time(t.get("time"))
+        try:
+            price = _tick_float(t.get("price"))
+            size  = _tick_int(t.get("size"))
+            t_str = _fmt_time(t.get("time"))
+        except Exception:
+            continue
         if price <= 0:
             continue
         if last_price_tick is None:
