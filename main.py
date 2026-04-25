@@ -1483,7 +1483,7 @@ async def chip_scan(
 
 # ════════════════════════════════════════════════════════════════
 #  即時內外盤比 v4
-#  最新成交價：intraday/quote lastPrice（唯一可靠來源）
+#  最新成交價：intraday/trades 最後一筆，quote 僅作無逐筆資料時的 fallback
 #  全日外盤/內盤：intraday/volumes 分價量表逐列加總
 #  近30筆滾動：intraday/trades Tick Rule 推估
 # ════════════════════════════════════════════════════════════════
@@ -1561,14 +1561,14 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     """
     即時內外盤比 v4
 
-    三支 API 同時打：
-    - intraday/quote   → lastPrice（最新成交價，唯一可靠來源）
+    主要資料來源：
+    - intraday/trades?limit=500&sort=asc → 最新成交價 + Tick Rule 推估近30筆
     - intraday/volumes → volumeAtAsk / volumeAtBid 分價量表加總（全日精確）
-    - intraday/trades?limit=500&sort=asc → Tick Rule 推估近30筆（即時動能）
+    - intraday/quote   → 只有完全沒有逐筆資料時，才用 lastPrice fallback
 
     latest_price 來源優先順序：
-      1. quote.lastPrice
-      2. detail[-1]['price']（逐筆最後一筆，fallback）
+      1. detail[-1]['price']（sort=asc 後的今日最後一筆成交價）
+      2. quote.lastPrice（無逐筆資料時 fallback）
     """
     verify_token(x_token)
 
@@ -1583,20 +1583,16 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
 
     try:
         async with httpx.AsyncClient() as client:
-            quote_res, vol_res, trades_res = await asyncio.gather(
-                client.get(quote_url,  headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10),
+            vol_res, trades_res = await asyncio.gather(
                 client.get(vol_url,    headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10),
                 client.get(trades_url, headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10),
             )
-        quote_raw  = quote_res.json()
         vol_raw    = vol_res.json()
         trades_raw = trades_res.json()
     except Exception as e:
         return _tick_err(symbol, f"Fugle API 連線失敗：{e}")
 
-    # ── 最新成交價：quote.lastPrice ───────────────────────────────
-    quote_data  = quote_raw.get("data", {}) or {}
-    latest_price = _tick_float(quote_data.get("lastPrice")) or None
+    latest_price = None
 
     # ── 全日：volumes 分價量表，逐列加總 ──────────────────────────
     vol_data = vol_raw.get("data", [])
@@ -1640,9 +1636,20 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         last_price_tick = price
         detail.append({"time": t_str, "price": price, "size": size, "side": side})
 
-    # latest_price fallback：quote 拿不到時用逐筆最後一筆
-    if latest_price is None and detail:
+    # sort=asc 後 detail[-1] 是今日最後一筆成交，直接作為畫面現價。
+    if detail:
         latest_price = detail[-1]["price"]
+    else:
+        try:
+            async with httpx.AsyncClient() as client:
+                quote_res = await client.get(
+                    quote_url, headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10
+                )
+            quote_raw = quote_res.json()
+            quote_data = quote_raw.get("data", {}) or {}
+            latest_price = _tick_float(quote_data.get("lastPrice")) or None
+        except Exception:
+            latest_price = None
 
     recent_30 = detail[-30:]
     r_outer = sum(t["size"] for t in recent_30 if t["side"] == "outer")
