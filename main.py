@@ -1565,10 +1565,12 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     - intraday/trades?limit=500&sort=asc → 最新成交價 + Tick Rule 推估近30筆
     - intraday/volumes → volumeAtAsk / volumeAtBid 分價量表加總（全日精確）
     - intraday/quote   → 只有完全沒有逐筆資料時，才用價格欄位 fallback
+    - FinMind TaiwanStockPrice → quote 也無價時，最後用近10日最後收盤價 fallback
 
     latest_price 來源優先順序：
       1. detail[-1]['price']（sort=asc 後的今日最後一筆成交價）
       2. quote 的 lastPrice / closePrice / price（無逐筆資料時 fallback）
+      3. FinMind 最近收盤價（無逐筆且 quote 無價時 fallback）
     """
     verify_token(x_token)
 
@@ -1593,6 +1595,8 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         return _tick_err(symbol, f"Fugle API 連線失敗：{e}")
 
     latest_price = None
+    close_price = None
+    close_date = ""
 
     # ── 全日：volumes 分價量表，逐列加總 ──────────────────────────
     vol_data = vol_raw.get("data", [])
@@ -1656,6 +1660,28 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         except Exception:
             latest_price = None
 
+        if latest_price is None:
+            try:
+                fm_end = now.strftime("%Y-%m-%d")
+                fm_start = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+                fm_url = (
+                    f"https://api.finmindtrade.com/api/v4/data"
+                    f"?dataset=TaiwanStockPrice&data_id={symbol}"
+                    f"&start_date={fm_start}&end_date={fm_end}"
+                    f"&token={FINMIND_TOKEN}"
+                )
+                async with httpx.AsyncClient() as client:
+                    fm_res = await client.get(fm_url, timeout=10)
+                fm_raw = fm_res.json()
+                fm_rows = fm_raw.get("data", []) if fm_raw.get("msg") == "success" else []
+                if fm_rows:
+                    latest_row = fm_rows[-1]
+                    close_price = _tick_float(latest_row.get("close")) or None
+                    close_date = str(latest_row.get("date", ""))
+                    latest_price = close_price
+            except Exception:
+                latest_price = None
+
     recent_30 = detail[-30:]
     r_outer = sum(t["size"] for t in recent_30 if t["side"] == "outer")
     r_inner = sum(t["size"] for t in recent_30 if t["side"] == "inner")
@@ -1683,6 +1709,8 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         "r_ratio":      r_ratio,
         "trade_count":  len(detail),
         "latest_price": latest_price,
+        "close_price":  close_price,
+        "close_date":   close_date,
         "updated_at":   now.strftime("%H:%M:%S"),
         "trades":       detail[-50:],
     }
