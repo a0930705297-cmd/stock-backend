@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import yfinance as yf
+import asyncio
 
 warnings.filterwarnings("ignore")
 
@@ -1478,3 +1479,158 @@ async def chip_scan(
         "total": len(results),
         "note": f"共 {len(results)} 支雙買超，掃描 {len(code_list)} 支（{scan_date}）"
     }
+
+
+# ════════════════════════════════════════════════════════════════
+#  即時內外盤比 v3
+#  最新成交價：intraday/quote lastPrice（唯一可靠來源）
+#  全日外盤/內盤：intraday/volumes 分價量表逐列加總
+#  近30筆滾動：intraday/trades Tick Rule 推估
+# ════════════════════════════════════════════════════════════════
+
+_tick_cache: dict = {}
+_TICK_CACHE_SEC = 12
+
+def _fmt_time(t) -> str:
+    """Fugle time 欄位 → HH:MM:SS"""
+    if t is None:
+        return "—"
+    if isinstance(t, (int, float)):
+        return datetime.fromtimestamp(t).strftime("%H:%M:%S")
+    s = str(t)
+    if "T" in s:
+        try:
+            return s.split("T")[1][:8]
+        except Exception:
+            pass
+    try:
+        return datetime.fromtimestamp(float(s)).strftime("%H:%M:%S")
+    except Exception:
+        return s[:8] if len(s) >= 8 else s
+
+def _tick_err(symbol, msg):
+    return {
+        "symbol": symbol, "error": msg,
+        "outer": 0, "inner": 0, "ratio": 50, "total": 0,
+        "r_outer": 0, "r_inner": 0, "r_ratio": 50,
+        "trade_count": 0, "trades": [], "latest_price": None,
+    }
+
+@app.get("/tick_ratio/{symbol}")
+async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
+    """
+    即時內外盤比 v3
+
+    三支 API 同時打：
+    - intraday/quote   → lastPrice（最新成交價，唯一可靠來源）
+    - intraday/volumes → volumeAtAsk / volumeAtBid 分價量表加總（全日精確）
+    - intraday/trades?limit=500&sort=asc → Tick Rule 推估近30筆（即時動能）
+
+    latest_price 來源優先順序：
+      1. quote.lastPrice
+      2. detail[-1]['price']（逐筆最後一筆，fallback）
+    """
+    verify_token(x_token)
+
+    now = datetime.now()
+    cached = _tick_cache.get(symbol)
+    if cached and (now - cached["time"]).total_seconds() < _TICK_CACHE_SEC:
+        return cached["data"]
+
+    quote_url  = f"{FUGLE_BASE}/intraday/quote/{symbol}"
+    vol_url    = f"{FUGLE_BASE}/intraday/volumes/{symbol}"
+    trades_url = f"{FUGLE_BASE}/intraday/trades/{symbol}?limit=500&sort=asc"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            quote_res, vol_res, trades_res = await asyncio.gather(
+                client.get(quote_url,  headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10),
+                client.get(vol_url,    headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10),
+                client.get(trades_url, headers={"X-API-KEY": FUGLE_API_KEY}, timeout=10),
+            )
+        quote_raw  = quote_res.json()
+        vol_raw    = vol_res.json()
+        trades_raw = trades_res.json()
+    except Exception as e:
+        return _tick_err(symbol, f"Fugle API 連線失敗：{e}")
+
+    # ── 最新成交價：quote.lastPrice ───────────────────────────────
+    quote_data  = quote_raw.get("data", {}) or {}
+    latest_price = float(quote_data.get("lastPrice", 0) or 0) or None
+
+    # ── 全日：volumes 分價量表，逐列加總 ──────────────────────────
+    vol_data = vol_raw.get("data", [])
+    if isinstance(vol_data, list) and vol_data:
+        outer_day = sum(int(row.get("volumeAtAsk", 0) or 0) for row in vol_data)
+        inner_day = sum(int(row.get("volumeAtBid", 0) or 0) for row in vol_data)
+    elif isinstance(vol_data, dict):
+        # 防禦：萬一 API 回傳單一 dict
+        outer_day = int(vol_data.get("volumeAtAsk", 0) or 0)
+        inner_day = int(vol_data.get("volumeAtBid", 0) or 0)
+    else:
+        outer_day = inner_day = 0
+
+    total_day = outer_day + inner_day
+    ratio_day = round(outer_day / total_day * 100, 1) if total_day > 0 else 50.0
+
+    # ── 近30筆：trades Tick Rule ──────────────────────────────────
+    trades_list = trades_raw.get("data", [])
+    detail = []
+    last_price_tick = None
+    last_side = "outer"
+
+    for t in trades_list:
+        price = float(t.get("price", 0) or 0)
+        size  = int(t.get("size",  0) or 0)
+        t_str = _fmt_time(t.get("time"))
+        if price <= 0:
+            continue
+        if last_price_tick is None:
+            side = "outer"
+        elif price > last_price_tick:
+            side = "outer"
+        elif price < last_price_tick:
+            side = "inner"
+        else:
+            side = last_side
+        last_side       = side
+        last_price_tick = price
+        detail.append({"time": t_str, "price": price, "size": size, "side": side})
+
+    # latest_price fallback：quote 拿不到時用逐筆最後一筆
+    if latest_price is None and detail:
+        latest_price = detail[-1]["price"]
+
+    recent_30 = detail[-30:]
+    r_outer = sum(t["size"] for t in recent_30 if t["side"] == "outer")
+    r_inner = sum(t["size"] for t in recent_30 if t["side"] == "inner")
+    r_total = r_outer + r_inner
+    r_ratio = round(r_outer / r_total * 100, 1) if r_total > 0 else 50.0
+
+    # fallback：volumes 沒資料時改用 tick rule 全日估算
+    if total_day == 0 and detail:
+        outer_day = sum(t["size"] for t in detail if t["side"] == "outer")
+        inner_day = sum(t["size"] for t in detail if t["side"] == "inner")
+        total_day = outer_day + inner_day
+        ratio_day = round(outer_day / total_day * 100, 1) if total_day > 0 else 50.0
+
+    if not detail and total_day == 0:
+        return _tick_err(symbol, "無資料。可能原因：非交易時段、代號有誤，或 Fugle 未提供此股票資料。")
+
+    result = {
+        "symbol":       symbol,
+        "outer":        outer_day,
+        "inner":        inner_day,
+        "total":        total_day,
+        "ratio":        ratio_day,
+        "r_outer":      r_outer,
+        "r_inner":      r_inner,
+        "r_ratio":      r_ratio,
+        "trade_count":  len(detail),
+        "latest_price": latest_price,
+        "updated_at":   now.strftime("%H:%M:%S"),
+        "trades":       detail[-50:],
+    }
+
+    _tick_cache[symbol] = {"data": result, "time": now}
+    return result
