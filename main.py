@@ -1562,13 +1562,13 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     即時內外盤比 v4
 
     主要資料來源：
-    - intraday/trades?limit=500&sort=asc → 最新成交價 + Tick Rule 推估近30筆
+    - intraday/trades?limit=500&sort=desc → 最新500筆，再本地轉成舊到新做 Tick Rule
     - intraday/volumes → volumeAtAsk / volumeAtBid 分價量表加總（全日精確）
     - intraday/quote   → 只有完全沒有逐筆資料時，才用價格欄位 fallback
     - FinMind TaiwanStockPrice → quote 也無價時，最後用近10日最後收盤價 fallback
 
     latest_price 來源優先順序：
-      1. detail[-1]['price']（sort=asc 後的今日最後一筆成交價）
+      1. detail[-1]['price']（最新500筆本地轉舊到新後的最後一筆成交價）
       2. quote 的 lastPrice / closePrice / price（無逐筆資料時 fallback）
       3. FinMind 最近收盤價（無逐筆且 quote 無價時 fallback）
     """
@@ -1581,7 +1581,8 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
 
     quote_url  = f"{FUGLE_BASE}/intraday/quote/{symbol}"
     vol_url    = f"{FUGLE_BASE}/intraday/volumes/{symbol}"
-    trades_url = f"{FUGLE_BASE}/intraday/trades/{symbol}?limit=500&sort=asc"
+    # 先抓最新500筆；不能用 sort=asc，否則會拿到開盤後最早500筆。
+    trades_url = f"{FUGLE_BASE}/intraday/trades/{symbol}?limit=500&sort=desc"
 
     try:
         async with httpx.AsyncClient() as client:
@@ -1614,7 +1615,9 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     ratio_day = round(outer_day / total_day * 100, 1) if total_day > 0 else 50.0
 
     # ── 近30筆：trades Tick Rule ──────────────────────────────────
-    trades_list = trades_raw.get("data", [])
+    # Fugle 回傳最新→最舊，先反轉成舊→新，Tick Rule 才能正確比較前一筆。
+    trades_data = trades_raw.get("data", [])
+    trades_list = list(reversed(trades_data)) if isinstance(trades_data, list) else []
     detail = []
     last_price_tick = None
     last_side = "outer"
@@ -1640,7 +1643,7 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         last_price_tick = price
         detail.append({"time": t_str, "price": price, "size": size, "side": side})
 
-    # sort=asc 後 detail[-1] 是今日最後一筆成交，直接作為畫面現價。
+    # 最新500筆反轉後 detail[-1] 是目前最新一筆成交，直接作為畫面現價。
     if detail:
         latest_price = detail[-1]["price"]
     else:
