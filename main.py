@@ -1804,13 +1804,21 @@ _prev_flow:  dict = {}     # 上一次的產業流向（用來算「較上次」
 
 def _flow_cache_key() -> str:
     now = datetime.now()
-    slot = (now.hour * 60 + now.minute) // 5  # 5分鐘為單位
+    slot = (now.hour * 60 + now.minute) // 3  # 3分鐘為單位
     return f"{now.date()}_{slot}"
 
 def _prev_cache_key() -> str:
     now = datetime.now()
-    slot = (now.hour * 60 + now.minute) // 5 - 1
+    slot = (now.hour * 60 + now.minute) // 3 - 1
     return f"{now.date()}_{max(slot,0)}"
+
+def _is_market_live(now: datetime | None = None) -> bool:
+    """僅在台股盤中開放 Discord 自動推播。"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 540 <= minutes < 810  # 09:00 - 13:30
 
 
 # ── TWSE MIS：分批抓上市＋上櫃股票即時價格 ─────────────────────
@@ -1989,7 +1997,7 @@ def _build_industry_flow(stock_data: dict) -> dict:
 
 # ══════════════════════════════════════════════════════════════
 #  Endpoint 1：全市場資金流向總覽  GET /flow/summary
-#  ※ 5分鐘快取；第一次約15秒，之後很快
+#  ※ 3分鐘快取；第一次約15秒，之後很快
 # ══════════════════════════════════════════════════════════════
 @app.get("/flow/summary")
 async def flow_summary(x_token: str = Header(default=None)):
@@ -2291,6 +2299,9 @@ async def _check_and_alert(flow_result: dict, ind_thr: float, stock_thr: float):
     """
     ck = _flow_cache_key()
     alert_jobs = []
+    push_time = datetime.now()
+    push_time_str = push_time.strftime("%H:%M:%S")
+    data_time_str = flow_result.get("updated_at", "") or "—"
 
     # ── 1. 產業警示 ─────────────────────────────────────────
     for ind, g in flow_result.get("industry", {}).items():
@@ -2318,7 +2329,8 @@ async def _check_and_alert(flow_result: dict, ind_thr: float, stock_thr: float):
 
         msg = (
             f"💰 **{ind}** 🔴資金流入\n"
-            f"{datetime.now().strftime('%H:%M')}\n\n"
+            f"資料時間：{data_time_str}\n"
+            f"推播時間：{push_time_str}\n\n"
             f"淨額：**{_fmt_yi(net)}**　{prev_str}\n"
             f"流入：{_fmt_yi(g.get('in_amount',0))} ｜ 流出：{_fmt_yi(g.get('out_amount',0))}\n"
             f"資金集中度：{conc}%（{conc_str}）\n\n"
@@ -2336,7 +2348,8 @@ async def _check_and_alert(flow_result: dict, ind_thr: float, stock_thr: float):
 
         msg = (
             f"🚨 **{s['code']} {s.get('name','')}**　資金大量流入\n"
-            f"{datetime.now().strftime('%H:%M')}\n\n"
+            f"資料時間：{data_time_str}\n"
+            f"推播時間：{push_time_str}\n\n"
             f"現價：**{s['price']:.1f}**　"
             f"漲跌：**{'+' if s['chg_pct']>=0 else ''}{s['chg_pct']:.2f}%**\n"
             f"成交額：{s.get('amount',0):.2f}億　"
@@ -2376,6 +2389,8 @@ async def flow_monitor(
     """
     verify_token(x_token)
 
+    now = datetime.now()
+
     # 取最新快取（沒有就重新抓）
     ck = _flow_cache_key()
     if ck in _flow_cache:
@@ -2414,6 +2429,20 @@ async def flow_monitor(
         }
         _flow_cache[ck] = flow_result
 
+    if not _is_market_live(now):
+        return {
+            "ok":          True,
+            "alerted":     0,
+            "ind_thr":     ind_thr,
+            "stock_thr":   stock_thr,
+            "scanned":     flow_result.get("scanned", 0),
+            "updated_at":  flow_result.get("updated_at", ""),
+            "discord_set": bool(DISCORD_WEBHOOK),
+            "checked_at":  now.strftime("%H:%M:%S"),
+            "market_live": False,
+            "message":     "目前非盤中時段，已跳過 Discord 推播",
+        }
+
     # 執行警示檢查
     alerted_count = await _check_and_alert(flow_result, ind_thr, stock_thr)
 
@@ -2425,7 +2454,8 @@ async def flow_monitor(
         "scanned":     flow_result.get("scanned", 0),
         "updated_at":  flow_result.get("updated_at", ""),
         "discord_set": bool(DISCORD_WEBHOOK),
-        "checked_at":  datetime.now().strftime("%H:%M:%S"),
+        "checked_at":  now.strftime("%H:%M:%S"),
+        "market_live": True,
     }
 
 
@@ -2438,9 +2468,11 @@ async def test_discord(x_token: str = Header(default=None)):
     verify_token(x_token)
     if not DISCORD_WEBHOOK:
         return {"ok": False, "error": "DISCORD_WEBHOOK 環境變數未設定"}
+    now = datetime.now()
     ok = await asyncio.to_thread(send_discord,
         f"✅ **股票雷達連線成功！**\n"
-        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"資料時間：測試訊息\n"
+        f"推播時間：{now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"Railway 後端正常運作，Discord 警示已啟用 🎉\n"
         f"產業流入門檻：20億　個股流入門檻：5億"
     )
