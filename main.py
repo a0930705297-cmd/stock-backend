@@ -1721,123 +1721,507 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     _tick_cache[symbol] = {"data": result, "time": now}
     return result
 
-# ── 臨時測試 endpoint（測完可刪）────────────────────────
-# 貼到 main.py 底部，deploy 後瀏覽器直接開：
-# https://你的railway網址/test_apis?token=0921
+# ════════════════════════════════════════════════════════════════
+#  即時資金雷達 — 正式版後端
+#  資料來源：TWSE MIS（盤中即時）+ TWSE OpenAPI（全市場名單）
+#  貼到 main.py 最底部
+# ════════════════════════════════════════════════════════════════
 
-@app.get("/test_apis")
-async def test_apis(token: str = ""):
-    # 這個測試 endpoint 直接用 query string 帶 token（方便瀏覽器測試）
-    if token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import unquote
+import time as _time
 
-    import time
-    results = {}
+# ── MIS Headers ─────────────────────────────────────────────
+MIS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer":    "https://mis.twse.com.tw/stock/fibest.jsp",
+    "Accept":     "application/json, text/plain, */*",
+}
 
-    def try_get(url, extra_headers=None, timeout=8):
-        h = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://mis.twse.com.tw/",
-            "Accept": "application/json, text/plain, */*",
+# ── 產業分類（用在資金流向彙整）───────────────────────────────
+INDUSTRY_GROUPS = {
+    "半導體業", "電腦及週邊設備業", "電子零組件業", "光電業",
+    "通信網路業", "其他電子業", "電子通路業", "資訊服務業",
+    "航運業", "金融業", "生技醫療業", "電機機械", "汽車工業",
+    "鋼鐵工業", "建材營造業", "油電燃氣業", "觀光餐旅業",
+    "貿易百貨業", "化學工業", "塑膠工業", "紡織纖維", "食品工業",
+    "造紙工業", "橡膠工業", "玻璃陶瓷", "水泥工業",
+}
+
+# ── 全市場股票清單快取 ────────────────────────────────────────
+_stock_list_cache: list = []      # [{code, name, industry, market}, ...]
+_stock_list_fetched: str = ""     # 上次抓取日期
+
+def _get_stock_list() -> list:
+    """抓上市＋上櫃股票清單（含產業、市場別）"""
+    global _stock_list_cache, _stock_list_fetched
+    today = datetime.today().strftime("%Y-%m-%d")
+    if _stock_list_cache and _stock_list_fetched == today:
+        return _stock_list_cache
+
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo&start_date=2024-01-01"
+        data = twse_get(url)
+        if not data or data.get("msg") != "success":
+            return _stock_list_cache
+        rows = data.get("data", [])
+
+        result = []
+        for row in rows:
+            code = str(row.get("stock_id", "")).strip()
+            name = str(row.get("stock_name", "")).strip()
+            stock_type = str(row.get("type", "")).strip().lower()
+            industry = str(row.get("industry_category", "")).strip() or "其他"
+            if stock_type not in {"twse", "tpex"}:
+                continue
+            if not code.isdigit() or len(code) != 4:
+                continue
+            result.append({
+                "code":     code,
+                "name":     name,
+                "industry": industry,
+                "market":   "tse" if stock_type == "twse" else "otc",
+            })
+
+        if result:
+            _stock_list_cache = result
+            _stock_list_fetched = today
+        return _stock_list_cache if _stock_list_cache else result
+
+    except Exception as e:
+        return _stock_list_cache  # 回傳舊快取
+
+
+def _mis_symbol(code: str, market: str = "tse") -> str:
+    market = "otc" if str(market).lower() == "otc" else "tse"
+    return f"{market}_{code}.tw"
+
+
+# ── 即時流向快取 ───────────────────────────────────────────────
+_flow_cache: dict = {}     # cache_key → result
+_prev_flow:  dict = {}     # 上一次的產業流向（用來算「較上次」）
+
+def _flow_cache_key() -> str:
+    now = datetime.now()
+    slot = (now.hour * 60 + now.minute) // 5  # 5分鐘為單位
+    return f"{now.date()}_{slot}"
+
+def _prev_cache_key() -> str:
+    now = datetime.now()
+    slot = (now.hour * 60 + now.minute) // 5 - 1
+    return f"{now.date()}_{max(slot,0)}"
+
+
+# ── TWSE MIS：分批抓上市＋上櫃股票即時價格 ─────────────────────
+def _fetch_mis_batch(codes_tw: list) -> list:
+    """
+    codes_tw: ["tse_2330.tw", "tse_2317.tw", ...]
+    回傳 MIS msgArray list
+    """
+    ex_ch = "|".join(codes_tw)
+    url = (f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+           f"?ex_ch={ex_ch}&json=1&delay=0")
+    try:
+        r = requests.get(url, headers=MIS_HEADERS, timeout=12, verify=False)
+        d = r.json()
+        return d.get("msgArray", [])
+    except:
+        return []
+
+def _parse_mis_row(row: dict, industry: str, name: str) -> dict | None:
+    """解析 MIS 單筆資料"""
+    try:
+        # MIS 欄位說明：
+        # c = 代號, n = 名稱
+        # z = 成交價, y = 昨收, u = 漲停, w = 跌停
+        # v = 累計成交量(張)
+        # tv = 最近一筆成交量(張)
+        code = str(
+            row.get("c", row.get("@", "").split(".")[0].replace("tse_", "").replace("otc_", ""))
+        ).strip()
+        if not code or not code.isdigit() or len(code) != 4:
+            return None
+
+        price_str = str(row.get("z","0") or "0").replace(",","")
+        prev_str  = str(row.get("y","0") or "0").replace(",","")
+        vol_str   = str(row.get("v","0") or row.get("tv","0") or "0").replace(",","")
+
+        price = float(price_str) if price_str and price_str != "-" else 0.0
+        prev  = float(prev_str)  if prev_str  and prev_str  != "-" else 0.0
+        vol   = int(float(vol_str)) if vol_str and vol_str != "-" else 0
+
+        if price <= 0 or prev <= 0:
+            return None
+
+        change  = round(price - prev, 2)
+        chg_pct = round(change / prev * 100, 2)
+
+        # 成交金額（億元）= 張數 × 股價 × 1000股 ÷ 1億
+        amount = round(vol * price * 1000 / 1e8, 2)
+
+        # 資金流向：漲→流入，跌→流出，平→不計
+        flow_in  = amount if chg_pct > 0 else 0.0
+        flow_out = amount if chg_pct < 0 else 0.0
+        net_flow = round(flow_in - flow_out, 2)
+
+        stk_name = str(row.get("n", name or code)).strip()
+
+        return {
+            "code":     code,
+            "name":     stk_name,
+            "industry": industry,
+            "price":    price,
+            "prev":     prev,
+            "change":   change,
+            "chg_pct":  chg_pct,
+            "vol":      vol,
+            "amount":   amount,
+            "flow_in":  flow_in,
+            "flow_out": flow_out,
+            "net_flow": net_flow,
         }
-        if extra_headers:
-            h.update(extra_headers)
-        try:
-            t0 = time.time()
-            r = requests.get(url, headers=h, timeout=timeout, verify=False)
-            elapsed = round(time.time() - t0, 2)
+    except:
+        return None
+
+
+def _fetch_all_market() -> dict:
+    """
+    分批抓全市場即時資料
+    回傳 {code: stock_dict}
+    """
+    stock_list = _get_stock_list()
+    if not stock_list:
+        return {}
+
+    # 建立 code → {name, industry, market} 對照
+    info_map = {s["code"]: s for s in stock_list}
+    all_stocks = stock_list
+
+    # 分批：每批 150 支（MIS URL長度限制）
+    BATCH = 150
+    batches = []
+    for i in range(0, len(all_stocks), BATCH):
+        batch_stocks = all_stocks[i:i+BATCH]
+        codes_tw = [_mis_symbol(s["code"], s.get("market", "tse")) for s in batch_stocks]
+        batches.append((batch_stocks, codes_tw))
+
+    stock_data: dict = {}
+
+    # 並行抓取（最多5個同時，避免被擋）
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {
+            ex.submit(_fetch_mis_batch, codes_tw): batch_stocks
+            for batch_stocks, codes_tw in batches
+        }
+        for future in as_completed(futures):
+            batch_stocks = futures[future]
             try:
-                d = r.json()
-                # 計算資料筆數
-                count = 0
-                if isinstance(d, list): count = len(d)
-                elif isinstance(d, dict):
-                    for key in ["data","msgArray","aaData"]:
-                        if key in d: count = len(d[key]); break
-                preview = str(d)[:200]
+                rows = future.result()
+                for row in rows:
+                    # 從 @ 欄位取代號
+                    at = str(row.get("@",""))
+                    code = at.split(".")[0].replace("tse_","").replace("otc_","")
+                    if not code:
+                        code = str(row.get("c",""))
+                    info = info_map.get(code, {})
+                    parsed = _parse_mis_row(
+                        row,
+                        info.get("industry","其他"),
+                        info.get("name","")
+                    )
+                    if parsed:
+                        stock_data[code] = parsed
             except:
-                preview = r.text[:200]
-                count = 0
-            return {
-                "status": r.status_code,
-                "elapsed_sec": elapsed,
-                "bytes": len(r.content),
-                "count": count,
-                "preview": preview
+                pass
+
+    return stock_data
+
+
+def _build_industry_flow(stock_data: dict) -> dict:
+    """彙整產業資金流向"""
+    groups: dict = {}
+
+    for s in stock_data.values():
+        ind = s["industry"] or "其他"
+        if ind not in groups:
+            groups[ind] = {
+                "name":        ind,
+                "type":        "industry",
+                "in_amount":   0.0,
+                "out_amount":  0.0,
+                "stocks":      [],
             }
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        groups[ind]["in_amount"]  += s["flow_in"]
+        groups[ind]["out_amount"] += s["flow_out"]
+        groups[ind]["stocks"].append(s)
 
-    today     = datetime.today().strftime("%Y-%m-%d")
-    days_ago3 = (datetime.today() - timedelta(days=3)).strftime("%Y-%m-%d")
+    # 計算淨額、集中度、取前5大個股
+    result = {}
+    for ind, g in groups.items():
+        net   = round(g["in_amount"] - g["out_amount"], 2)
+        total = g["in_amount"] + g["out_amount"]
+        stocks_sorted = sorted(g["stocks"],
+                               key=lambda x: abs(x["net_flow"]), reverse=True)
+        conc = 0
+        if total > 0 and stocks_sorted:
+            conc = round(abs(stocks_sorted[0]["net_flow"]) / total * 100)
 
-    # ── 1. TWSE MIS 盤中即時（最想要的）────────────────
-    results["1_twse_mis_realtime"] = try_get(
-        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-        "?ex_ch=tse_2330.tw|tse_2317.tw|tse_2454.tw&json=1&delay=0"
-    )
+        result[ind] = {
+            "name":          ind,
+            "type":          "industry",
+            "net_amount":    round(net, 2),
+            "in_amount":     round(g["in_amount"], 2),
+            "out_amount":    round(g["out_amount"], 2),
+            "concentration": conc,
+            "stock_count":   len(g["stocks"]),
+            "stocks": [{
+                "code":     s["code"],
+                "name":     s["name"],
+                "price":    s["price"],
+                "chg_pct":  s["chg_pct"],
+                "amount":   s["amount"],
+                "net_flow": s["net_flow"],
+            } for s in stocks_sorted[:5]],
+        }
+    return result
 
-    # ── 2. TWSE OpenAPI 全市場（收盤後）────────────────
-    results["2_twse_openapi_all"] = try_get(
-        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-        extra_headers={"Referer": "https://openapi.twse.com.tw/"}
-    )
 
-    # ── 3. TWSE 盤中集體行情（另一個入口）──────────────
-    results["3_twse_rtindex"] = try_get(
-        "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
-    )
+# ══════════════════════════════════════════════════════════════
+#  Endpoint 1：全市場資金流向總覽  GET /flow/summary
+#  ※ 5分鐘快取；第一次約15秒，之後很快
+# ══════════════════════════════════════════════════════════════
+@app.get("/flow/summary")
+async def flow_summary(x_token: str = Header(default=None)):
+    verify_token(x_token)
 
-    # ── 4. TPEX 上櫃即時行情 ────────────────────────
-    results["4_tpex_realtime"] = try_get(
-        "https://www.tpex.org.tw/www/zh-tw/stock/real-time/list",
-        extra_headers={"Referer": "https://www.tpex.org.tw/"}
-    )
+    ck = _flow_cache_key()
+    if ck in _flow_cache:
+        return {**_flow_cache[ck], "cached": True}
 
-    # ── 5. TPEX 另一個 endpoint ─────────────────────
-    results["5_tpex_alt"] = try_get(
-        "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
-        "st43_result.php?l=zh-tw&response=json"
-    )
+    t0 = _time.time()
 
-    # ── 6. Yahoo Finance 即時（備援）────────────────
-    results["6_yahoo_2330"] = try_get(
-        "https://query1.finance.yahoo.com/v8/finance/chart/2330.TW"
-        "?interval=5m&range=1d",
-        extra_headers={"User-Agent": "Mozilla/5.0"}
-    )
+    # 抓上市＋上櫃即時資料
+    stock_data = _fetch_all_market()
+    if not stock_data:
+        return {"error": "無法取得市場資料", "industry": {}, "top_in": [], "top_out": []}
 
-    # ── 7. FinMind 即時 Snapshot（需要Sponsor方案）──
-    results["7_finmind_snapshot_all"] = try_get(
-        f"https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
-        f"?token={FINMIND_TOKEN}"
-    )
+    # 彙整產業流向
+    industry_flow = _build_industry_flow(stock_data)
 
-    # ── 8. FinMind 全市場今日價格（不帶data_id）──────
-    results["8_finmind_price_all"] = try_get(
-        f"https://api.finmindtrade.com/api/v4/data"
-        f"?dataset=TaiwanStockPrice&start_date={days_ago3}&end_date={today}"
-        f"&token={FINMIND_TOKEN}"
-    )
+    # 取上一次快取做「較上次」比較
+    prev_ck = _prev_cache_key()
+    prev_industry = _flow_cache.get(prev_ck, {}).get("industry", {})
 
-    # ── 9. FinMind 全市場今日法人（不帶data_id）──────
-    results["9_finmind_inst_all"] = try_get(
-        f"https://api.finmindtrade.com/api/v4/data"
-        f"?dataset=TaiwanStockInstitutionalInvestorsBuySell"
-        f"&start_date={today}&end_date={today}"
-        f"&token={FINMIND_TOKEN}"
-    )
-
-    # ── 整理總結 ─────────────────────────────────────
-    summary = {}
-    for k, v in results.items():
-        if v.get("status") == 200:
-            summary[k] = f"✅ OK — {v['count']} 筆，{v['elapsed_sec']}秒"
+    # 加上「較上次」差值
+    for ind, g in industry_flow.items():
+        prev_net = prev_industry.get(ind, {}).get("net_amount", None)
+        if prev_net is not None:
+            g["prev_net"]    = prev_net
+            g["prev_change"] = round(g["net_amount"] - prev_net, 2)
         else:
-            summary[k] = f"❌ {v.get('status','error')} — {v.get('error', v.get('preview',''))[:60]}"
+            g["prev_net"]    = None
+            g["prev_change"] = None
+
+    # 個股排行
+    all_s   = list(stock_data.values())
+    top_in  = sorted([s for s in all_s if s["chg_pct"] > 0],
+                     key=lambda x: x["flow_in"], reverse=True)[:20]
+    top_out = sorted([s for s in all_s if s["chg_pct"] < 0],
+                     key=lambda x: x["flow_out"], reverse=True)[:20]
+
+    elapsed = round(_time.time() - t0, 1)
+    result = {
+        "industry":    industry_flow,
+        "top_in":      top_in,
+        "top_out":     top_out,
+        "_stock_data": stock_data,
+        "scanned":     len(stock_data),
+        "elapsed_sec": elapsed,
+        "updated_at":  datetime.now().strftime("%H:%M"),
+        "data_date":   datetime.now().strftime("%Y-%m-%d"),
+        "cached":      False,
+    }
+
+    # 存快取（只保留最近6筆 = 30分鐘）
+    _flow_cache[ck] = result
+    if len(_flow_cache) > 6:
+        del _flow_cache[next(iter(_flow_cache))]
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+#  Endpoint 2：個股流向詳細  GET /flow/stock/{code}
+#  回傳今日即時 + 近20日歷史（用FinMind單股查詢，免費版可用）
+# ══════════════════════════════════════════════════════════════
+@app.get("/flow/stock/{code}")
+async def flow_stock(code: str, x_token: str = Header(default=None)):
+    verify_token(x_token)
+
+    stock_list = _get_stock_list()
+    info_map = {s["code"]: s for s in stock_list}
+    info = info_map.get(code, {})
+
+    # 即時資料：MIS 單股
+    mis_rows = _fetch_mis_batch([_mis_symbol(code, info.get("market", "tse"))])
+    latest = {}
+    if mis_rows:
+        parsed = _parse_mis_row(mis_rows[0], info.get("industry",""), info.get("name",""))
+        if parsed:
+            latest = parsed
+
+    # 歷史資料：FinMind 單股（免費版可用）
+    today = datetime.today()
+    start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
+
+    price_rows = finmind_get("TaiwanStockPrice", code, start, end)
+    inst_rows  = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", code, start, end)
+
+    # 法人按日期整理
+    inst_map: dict = {}
+    for row in inst_rows:
+        d = row.get("date","")
+        inst_map.setdefault(d, {"foreign":0,"trust":0,"dealer":0})
+        n = row.get("name","")
+        b = max(int(row.get("buy",0)),0) // 1000
+        s = max(int(row.get("sell",0)),0) // 1000
+        if n == "Foreign_Investor":   inst_map[d]["foreign"] = b - s
+        elif n == "Investment_Trust": inst_map[d]["trust"]   = b - s
+        elif n == "Dealer_self":      inst_map[d]["dealer"]  = b - s
+
+    # 找所屬產業/主題
+    info = next((s for s in stock_list if s["code"] == code), {})
+    name     = latest.get("name") or info.get("name", code)
+    industry = info.get("industry","")
+    belongs_to = [{"name": industry, "type": "industry"}] if industry else []
+
+    # 時間軸（近20日，最新在前）
+    timeline = []
+    for row in reversed(price_rows[-20:]):
+        d       = row.get("date","")
+        price   = float(row.get("close",0) or 0)
+        change  = float(row.get("change",0) or 0)
+        prev_p  = price - change
+        chg_pct = round(change/prev_p*100, 2) if prev_p > 0 else 0.0
+        vol     = int(row.get("Trading_Volume",0) or 0)
+        money   = float(row.get("Trading_money",0) or 0)
+        amount  = round(money/1e8, 2) if money > 0 else round(vol*price*1000/1e8, 2)
+        inst    = inst_map.get(d, {})
+        fn = inst.get("foreign",0)
+        tn = inst.get("trust",0)
+        dn = inst.get("dealer",0)
+        timeline.append({
+            "date":        d,
+            "price":       price,
+            "change":      change,
+            "chg_pct":     chg_pct,
+            "amount":      amount,
+            "net_flow":    round(amount if chg_pct>=0 else -amount, 2),
+            "flow_dir":    "in" if chg_pct >= 0 else "out",
+            "foreign_net": fn,
+            "trust_net":   tn,
+            "dealer_net":  dn,
+            "inst_total":  fn + tn + dn,
+        })
 
     return {
-        "test_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "summary": summary,
-        "detail": results,
+        "code":       code,
+        "name":       name,
+        "industry":   industry,
+        "belongs_to": belongs_to,
+        "latest":     latest,
+        "timeline":   timeline,
+        "updated_at": datetime.now().strftime("%H:%M"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+#  Endpoint 3：產業詳細  GET /flow/industry/{name}
+# ══════════════════════════════════════════════════════════════
+@app.get("/flow/industry/{name}")
+async def flow_industry(name: str, x_token: str = Header(default=None)):
+    verify_token(x_token)
+    name = unquote(name)
+
+    # 從快取取最新資料
+    ck = _flow_cache_key()
+    cached = _flow_cache.get(ck) or _flow_cache.get(_prev_cache_key())
+
+    if cached and name in cached.get("industry", {}):
+        ind_data = cached["industry"][name]
+        # 從快取裡拿完整股票資料，避免只剩 summary 的前 5 檔縮略資料
+        stock_data = cached.get("_stock_data", {})
+        full_stocks = [
+            s for s in stock_data.values()
+            if s.get("industry") == name
+        ]
+        total_a = sum(s["amount"] for s in full_stocks) or 1
+        stocks_out = []
+        for s in sorted(full_stocks, key=lambda x: abs(x["net_flow"]), reverse=True):
+            pct = round(abs(s["net_flow"]) / total_a * 100)
+            stocks_out.append({**s, "pct": pct})
+        return {
+            "name":       name,
+            "net_amount": ind_data["net_amount"],
+            "in_amount":  ind_data["in_amount"],
+            "out_amount": ind_data["out_amount"],
+            "prev_change": ind_data.get("prev_change"),
+            "stocks":     stocks_out,
+            "updated_at": cached.get("updated_at",""),
+        }
+
+    # 快取沒有 → 即時抓這個產業的股票
+    stock_list = _get_stock_list()
+    stocks_in_industry = [s for s in stock_list if s["industry"] == name]
+    if not stocks_in_industry:
+        return {"error": f"找不到產業：{name}", "stocks": []}
+
+    codes_tw = [_mis_symbol(s["code"], s.get("market", "tse")) for s in stocks_in_industry]
+    rows = _fetch_mis_batch(codes_tw)
+
+    info_map = {s["code"]: s for s in stock_list}
+    stocks = []
+    for row in rows:
+        at   = str(row.get("@",""))
+        code = at.split(".")[0].replace("tse_","").replace("otc_","")
+        info = info_map.get(code, {})
+        p = _parse_mis_row(row, name, info.get("name",""))
+        if p:
+            stocks.append(p)
+
+    in_a  = sum(s["flow_in"]  for s in stocks)
+    out_a = sum(s["flow_out"] for s in stocks)
+    total_a = in_a + out_a or 1
+
+    stocks_sorted = sorted(stocks, key=lambda x: abs(x["net_flow"]), reverse=True)
+    stocks_out = [{**s, "pct": round(abs(s["net_flow"])/total_a*100)} for s in stocks_sorted]
+
+    return {
+        "name":       name,
+        "net_amount": round(in_a - out_a, 2),
+        "in_amount":  round(in_a, 2),
+        "out_amount": round(out_a, 2),
+        "prev_change": None,
+        "stocks":     stocks_out,
+        "updated_at": datetime.now().strftime("%H:%M"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+#  Endpoint 4：狀態確認  GET /flow/status
+# ══════════════════════════════════════════════════════════════
+@app.get("/flow/status")
+async def flow_status(x_token: str = Header(default=None)):
+    verify_token(x_token)
+    ck  = _flow_cache_key()
+    has = ck in _flow_cache
+    return {
+        "ok":          True,
+        "has_cache":   has,
+        "scanned":     _flow_cache[ck].get("scanned", 0) if has else 0,
+        "updated_at":  _flow_cache[ck].get("updated_at","") if has else "",
+        "elapsed_sec": _flow_cache[ck].get("elapsed_sec","") if has else "",
+        "cache_key":   ck,
+        "stock_list_count": len(_stock_list_cache),
     }
