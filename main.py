@@ -26,6 +26,7 @@ FUGLE_API_KEY     = os.environ.get("FUGLE_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FUGLE_BASE        = "https://api.fugle.tw/marketdata/v1.0/stock"
 API_TOKEN         = os.environ.get("API_TOKEN", "0921")
+DISCORD_WEBHOOK   = os.environ.get("DISCORD_WEBHOOK", "")
 
 
 # 分析結果快取
@@ -2090,6 +2091,21 @@ async def flow_stock(code: str, x_token: str = Header(default=None)):
         elif n == "Investment_Trust": inst_map[d]["trust"]   = b - s
         elif n == "Dealer_self":      inst_map[d]["dealer"]  = b - s
 
+    latest_inst = {"foreign": 0, "trust": 0, "dealer": 0}
+    if inst_map:
+        latest_inst = inst_map[sorted(inst_map.keys())[-1]]
+
+    latest.update({
+        "foreign_net": latest_inst.get("foreign", 0),
+        "trust_net":   latest_inst.get("trust", 0),
+        "dealer_net":  latest_inst.get("dealer", 0),
+        "inst_total": (
+            latest_inst.get("foreign", 0)
+            + latest_inst.get("trust", 0)
+            + latest_inst.get("dealer", 0)
+        ),
+    })
+
     # 找所屬產業/主題
     info = next((s for s in stock_list if s["code"] == code), {})
     name     = latest.get("name") or info.get("name", code)
@@ -2225,3 +2241,207 @@ async def flow_status(x_token: str = Header(default=None)):
         "cache_key":   ck,
         "stock_list_count": len(_stock_list_cache),
     }
+
+
+# ════════════════════════════════════════════════════════════════
+#  Discord 警示系統
+# ════════════════════════════════════════════════════════════════
+
+# 已推播記錄（避免同一個訊號重複推播）
+# key = "產業名稱_cache_key" or "股票代號_cache_key"
+_alerted: set = set()
+
+def _fmt_yi(v: float) -> str:
+    """格式化億元"""
+    a = abs(v)
+    s = "+" if v >= 0 else "-"
+    if a >= 10000: return f"{s}{a/10000:.1f}兆"
+    if a >= 1:     return f"{s}{a:.2f}億"
+    return f"{s}{a*100:.0f}百萬"
+
+def send_discord(msg: str) -> bool:
+    """發送 Discord Webhook 訊息"""
+    if not DISCORD_WEBHOOK:
+        return False
+    try:
+        r = requests.post(
+            DISCORD_WEBHOOK,
+            json={"content": msg},
+            timeout=8
+        )
+        return r.status_code in (200, 204)
+    except Exception:
+        return False
+
+def _prune_alerted(current_ck: str):
+    """只保留目前與上一個 cache slot 的推播記錄，避免集合無限成長"""
+    prev_ck = _prev_cache_key()
+    keep = {
+        key for key in _alerted
+        if key.endswith(f"_{current_ck}") or key.endswith(f"_{prev_ck}")
+    }
+    _alerted.clear()
+    _alerted.update(keep)
+
+async def _check_and_alert(flow_result: dict, ind_thr: float, stock_thr: float):
+    """
+    掃描流向結果，超過門檻就推播 Discord
+    ind_thr   : 產業流入警示門檻（億元）
+    stock_thr : 個股流入警示門檻（億元）
+    """
+    ck = _flow_cache_key()
+    alert_jobs = []
+
+    # ── 1. 產業警示 ─────────────────────────────────────────
+    for ind, g in flow_result.get("industry", {}).items():
+        net = g.get("net_amount", 0)
+        if net < ind_thr:
+            continue
+        alert_key = f"ind_{ind}_{ck}"
+        if alert_key in _alerted:
+            continue
+
+        # 前5大個股
+        top_stocks = g.get("stocks", [])[:5]
+        stock_lines = "\n".join([
+            f"  {i+1}. **{s['code']} {s.get('name','')}** "
+            f"{'+' if s['chg_pct']>=0 else ''}{s['chg_pct']:.2f}%  "
+            f"〔流入 {_fmt_yi(s['net_flow'])}〕"
+            for i, s in enumerate(top_stocks)
+        ])
+
+        conc = g.get("concentration", 0)
+        conc_str = "⚠️ 高度集中" if conc >= 70 else "中度集中" if conc >= 40 else "低度集中"
+
+        prev_change = g.get("prev_change")
+        prev_str = f"較上次 ↑{_fmt_yi(prev_change)}" if prev_change and prev_change > 0 else ""
+
+        msg = (
+            f"💰 **{ind}** 🔴資金流入\n"
+            f"{datetime.now().strftime('%H:%M')}\n\n"
+            f"淨額：**{_fmt_yi(net)}**　{prev_str}\n"
+            f"流入：{_fmt_yi(g.get('in_amount',0))} ｜ 流出：{_fmt_yi(g.get('out_amount',0))}\n"
+            f"資金集中度：{conc}%（{conc_str}）\n\n"
+            f"前 {len(top_stocks)} 大影響個股：\n{stock_lines}"
+        )
+        alert_jobs.append((alert_key, msg))
+
+    # ── 2. 個股警示（流入 TOP 榜）────────────────────────────
+    for s in flow_result.get("top_in", []):
+        if s.get("flow_in", 0) < stock_thr:
+            break  # 已排序，後面都不會超過
+        alert_key = f"stk_{s['code']}_{ck}"
+        if alert_key in _alerted:
+            continue
+
+        msg = (
+            f"🚨 **{s['code']} {s.get('name','')}**　資金大量流入\n"
+            f"{datetime.now().strftime('%H:%M')}\n\n"
+            f"現價：**{s['price']:.1f}**　"
+            f"漲跌：**{'+' if s['chg_pct']>=0 else ''}{s['chg_pct']:.2f}%**\n"
+            f"成交額：{s.get('amount',0):.2f}億　"
+            f"流入：**{_fmt_yi(s['flow_in'])}**\n"
+            f"產業：{s.get('industry','—')}"
+        )
+        alert_jobs.append((alert_key, msg))
+
+    # ── 3. 批次發送（每則間隔0.5秒避免被擋）────────────────
+    sent_count = 0
+    for alert_key, msg in alert_jobs[:5]:  # 每次最多推 5 則，避免洗版
+        ok = await asyncio.to_thread(send_discord, msg)
+        if ok:
+            _alerted.add(alert_key)
+            sent_count += 1
+        await asyncio.sleep(0.5)
+
+    _prune_alerted(ck)
+    return sent_count
+
+
+# ══════════════════════════════════════════════════════════════
+#  Endpoint 5：手動觸發監控掃描  POST /flow/monitor
+#  前端每5分鐘自動呼叫，或手動測試
+# ══════════════════════════════════════════════════════════════
+@app.post("/flow/monitor")
+async def flow_monitor(
+    x_token: str = Header(default=None),
+    ind_thr:   float = 20.0,   # 產業流入警示門檻（億），預設20億
+    stock_thr: float = 5.0,    # 個股流入警示門檻（億），預設5億
+):
+    """
+    掃描資金流向並推播 Discord 警示
+    - ind_thr:   產業流入門檻（億元），超過就推播
+    - stock_thr: 個股流入門檻（億元），超過就推播
+    使用方式：POST /flow/monitor?ind_thr=30&stock_thr=10
+    """
+    verify_token(x_token)
+
+    # 取最新快取（沒有就重新抓）
+    ck = _flow_cache_key()
+    if ck in _flow_cache:
+        flow_result = _flow_cache[ck]
+    else:
+        # 沒快取就重新抓全市場
+        t0 = _time.time()
+        stock_data = _fetch_all_market()
+        if not stock_data:
+            return {"ok": False, "error": "無法取得市場資料", "alerted": 0}
+        industry_flow = _build_industry_flow(stock_data)
+        prev_ck = _prev_cache_key()
+        prev_industry = _flow_cache.get(prev_ck, {}).get("industry", {})
+        for ind, g in industry_flow.items():
+            prev_net = prev_industry.get(ind, {}).get("net_amount", None)
+            g["prev_net"]    = prev_net
+            g["prev_change"] = round(g["net_amount"] - prev_net, 2) if prev_net is not None else None
+
+        all_s   = list(stock_data.values())
+        top_in  = sorted([s for s in all_s if s["chg_pct"] > 0],
+                         key=lambda x: x["flow_in"], reverse=True)[:20]
+        top_out = sorted([s for s in all_s if s["chg_pct"] < 0],
+                         key=lambda x: x["flow_out"], reverse=True)[:20]
+
+        elapsed = round(_time.time() - t0, 1)
+        flow_result = {
+            "industry":    industry_flow,
+            "top_in":      top_in,
+            "top_out":     top_out,
+            "_stock_data": stock_data,
+            "scanned":     len(stock_data),
+            "elapsed_sec": elapsed,
+            "updated_at":  datetime.now().strftime("%H:%M"),
+            "data_date":   datetime.now().strftime("%Y-%m-%d"),
+            "cached":      False,
+        }
+        _flow_cache[ck] = flow_result
+
+    # 執行警示檢查
+    alerted_count = await _check_and_alert(flow_result, ind_thr, stock_thr)
+
+    return {
+        "ok":          True,
+        "alerted":     alerted_count,
+        "ind_thr":     ind_thr,
+        "stock_thr":   stock_thr,
+        "scanned":     flow_result.get("scanned", 0),
+        "updated_at":  flow_result.get("updated_at", ""),
+        "discord_set": bool(DISCORD_WEBHOOK),
+        "checked_at":  datetime.now().strftime("%H:%M:%S"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+#  Endpoint 6：Discord 測試  POST /flow/test_discord
+# ══════════════════════════════════════════════════════════════
+@app.post("/flow/test_discord")
+async def test_discord(x_token: str = Header(default=None)):
+    """測試 Discord Webhook 是否正常"""
+    verify_token(x_token)
+    if not DISCORD_WEBHOOK:
+        return {"ok": False, "error": "DISCORD_WEBHOOK 環境變數未設定"}
+    ok = await asyncio.to_thread(send_discord,
+        f"✅ **股票雷達連線成功！**\n"
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"Railway 後端正常運作，Discord 警示已啟用 🎉\n"
+        f"產業流入門檻：20億　個股流入門檻：5億"
+    )
+    return {"ok": ok, "webhook_set": True}
