@@ -1721,20 +1721,25 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     _tick_cache[symbol] = {"data": result, "time": now}
     return result
 
-# ── 臨時測試 endpoint，測完可以刪掉 ──────────────────────
-# 貼到 main.py 底部，deploy 後用瀏覽器開：
-# https://你的railway網址/test_apis
+# ── 臨時測試 endpoint（測完可刪）────────────────────────
+# 貼到 main.py 底部，deploy 後瀏覽器直接開：
+# https://你的railway網址/test_apis?token=0921
 
 @app.get("/test_apis")
-async def test_apis(x_token: str = Header(default=None)):
-    verify_token(x_token)
+async def test_apis(token: str = ""):
+    # 這個測試 endpoint 直接用 query string 帶 token（方便瀏覽器測試）
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     import time
     results = {}
 
-    def try_get(name, url, extra_headers=None, timeout=8):
-        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-             "Referer": "https://mis.twse.com.tw/"}
+    def try_get(url, extra_headers=None, timeout=8):
+        h = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://mis.twse.com.tw/",
+            "Accept": "application/json, text/plain, */*",
+        }
         if extra_headers:
             h.update(extra_headers)
         try:
@@ -1743,66 +1748,96 @@ async def test_apis(x_token: str = Header(default=None)):
             elapsed = round(time.time() - t0, 2)
             try:
                 d = r.json()
-                preview = str(d)[:150]
+                # 計算資料筆數
+                count = 0
+                if isinstance(d, list): count = len(d)
+                elif isinstance(d, dict):
+                    for key in ["data","msgArray","aaData"]:
+                        if key in d: count = len(d[key]); break
+                preview = str(d)[:200]
             except:
-                preview = r.text[:150]
-            return {"status": r.status_code, "elapsed": elapsed,
-                    "bytes": len(r.content), "preview": preview}
+                preview = r.text[:200]
+                count = 0
+            return {
+                "status": r.status_code,
+                "elapsed_sec": elapsed,
+                "bytes": len(r.content),
+                "count": count,
+                "preview": preview
+            }
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    today = datetime.today().strftime("%Y-%m-%d")
-    yesterday = (datetime.today() - timedelta(days=3)).strftime("%Y-%m-%d")
+    today     = datetime.today().strftime("%Y-%m-%d")
+    days_ago3 = (datetime.today() - timedelta(days=3)).strftime("%Y-%m-%d")
 
-    # TWSE MIS 盤中即時
-    results["twse_mis_realtime"] = try_get(
-        "MIS即時",
-        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw|tse_2317.tw&json=1&delay=0"
+    # ── 1. TWSE MIS 盤中即時（最想要的）────────────────
+    results["1_twse_mis_realtime"] = try_get(
+        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+        "?ex_ch=tse_2330.tw|tse_2317.tw|tse_2454.tw&json=1&delay=0"
     )
 
-    # TWSE OpenAPI 收盤全市場
-    results["twse_openapi_all"] = try_get(
-        "TWSE OpenAPI",
+    # ── 2. TWSE OpenAPI 全市場（收盤後）────────────────
+    results["2_twse_openapi_all"] = try_get(
         "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
         extra_headers={"Referer": "https://openapi.twse.com.tw/"}
     )
 
-    # TPEX 上櫃即時
-    results["tpex_realtime"] = try_get(
-        "TPEX即時",
-        "https://www.tpex.org.tw/www/zh-tw/stock/real-time/list"
+    # ── 3. TWSE 盤中集體行情（另一個入口）──────────────
+    results["3_twse_rtindex"] = try_get(
+        "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json"
     )
 
-    # Yahoo Finance 即時
-    results["yahoo_realtime"] = try_get(
-        "Yahoo即時",
-        "https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?interval=5m&range=1d",
+    # ── 4. TPEX 上櫃即時行情 ────────────────────────
+    results["4_tpex_realtime"] = try_get(
+        "https://www.tpex.org.tw/www/zh-tw/stock/real-time/list",
+        extra_headers={"Referer": "https://www.tpex.org.tw/"}
+    )
+
+    # ── 5. TPEX 另一個 endpoint ─────────────────────
+    results["5_tpex_alt"] = try_get(
+        "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/"
+        "st43_result.php?l=zh-tw&response=json"
+    )
+
+    # ── 6. Yahoo Finance 即時（備援）────────────────
+    results["6_yahoo_2330"] = try_get(
+        "https://query1.finance.yahoo.com/v8/finance/chart/2330.TW"
+        "?interval=5m&range=1d",
         extra_headers={"User-Agent": "Mozilla/5.0"}
     )
 
-    # FinMind 即時 snapshot（需要Sponsor）
-    results["finmind_snapshot"] = try_get(
-        "FinMind snapshot",
-        f"https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot?token={FINMIND_TOKEN}"
+    # ── 7. FinMind 即時 Snapshot（需要Sponsor方案）──
+    results["7_finmind_snapshot_all"] = try_get(
+        f"https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
+        f"?token={FINMIND_TOKEN}"
     )
 
-    # FinMind 全市場今日收盤（Backer）
-    results["finmind_price_all"] = try_get(
-        "FinMind全市場",
-        f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&start_date={yesterday}&end_date={today}&token={FINMIND_TOKEN}"
+    # ── 8. FinMind 全市場今日價格（不帶data_id）──────
+    results["8_finmind_price_all"] = try_get(
+        f"https://api.finmindtrade.com/api/v4/data"
+        f"?dataset=TaiwanStockPrice&start_date={days_ago3}&end_date={today}"
+        f"&token={FINMIND_TOKEN}"
     )
 
-    # FinMind 全市場法人今日（Backer）
-    results["finmind_inst_all"] = try_get(
-        "FinMind法人全市場",
-        f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&start_date={today}&end_date={today}&token={FINMIND_TOKEN}"
+    # ── 9. FinMind 全市場今日法人（不帶data_id）──────
+    results["9_finmind_inst_all"] = try_get(
+        f"https://api.finmindtrade.com/api/v4/data"
+        f"?dataset=TaiwanStockInstitutionalInvestorsBuySell"
+        f"&start_date={today}&end_date={today}"
+        f"&token={FINMIND_TOKEN}"
     )
+
+    # ── 整理總結 ─────────────────────────────────────
+    summary = {}
+    for k, v in results.items():
+        if v.get("status") == 200:
+            summary[k] = f"✅ OK — {v['count']} 筆，{v['elapsed_sec']}秒"
+        else:
+            summary[k] = f"❌ {v.get('status','error')} — {v.get('error', v.get('preview',''))[:60]}"
 
     return {
         "test_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "results": results,
-        "summary": {
-            k: ("✅ OK" if v.get("status") == 200 else f"❌ {v.get('status','error')}")
-            for k, v in results.items()
-        }
+        "summary": summary,
+        "detail": results,
     }
