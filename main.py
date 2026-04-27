@@ -2663,6 +2663,44 @@ async def test_discord(x_token: str = Header(default=None)):
     return {"ok": ok, "webhook_set": True}
 
 
+def _build_pullback_discord_msg(
+    code: str,
+    name: str,
+    price: float,
+    prev_low: float,
+    day_low: float,
+    break_level: float,
+    signal: str,
+    note: str,
+    now: datetime,
+    is_test: bool = False,
+) -> str:
+    icon = "⚡" if signal == "假跌破回站" else "🟢" if signal == "守住昨低" else "❌"
+    title_kind = "買點" if signal == "假跌破回站" else "觀察" if signal == "守住昨低" else "風控"
+    test_prefix = "【測試】" if is_test else ""
+
+    if signal == "假跌破回站":
+        action = "可行動：這是本策略最強買點，可考慮進場；若同時放量紅K / 站回 VWAP，訊號更強"
+        stop = f"停損：再次跌破昨低 {prev_low:g}，或進場後跌破今低 {day_low:g}，立即出場"
+    elif signal == "守住昨低":
+        action = "可行動：可觀察分批試單，需確認站穩 VWAP / 5MA 或出現紅K承接"
+        stop = f"停損：跌破昨低 {prev_low:g} 或跌破昨低 1%（{break_level:g}）立即出場"
+    else:
+        action = "可行動：不進場；若已持有，今日出局，停止監測此股"
+        stop = "重新觀察條件：收盤重新站回昨低，且隔日不再破低"
+
+    return (
+        f"{icon} **{test_prefix}隔日沖{title_kind}｜{signal}**\n"
+        f"{code} {name}\n"
+        f"現價：{price:g} ｜ 昨低：{prev_low:g} ｜ 今低：{day_low:g}\n"
+        f"判斷：{note}\n"
+        f"{action}\n"
+        f"{stop}\n"
+        f"資料時間：{now.strftime('%H:%M')}\n"
+        f"推播時間：{now.strftime('%H:%M:%S')}"
+    )
+
+
 @app.post("/pullback_monitor")
 async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
     """盤中監測隔日沖候選：守昨低、假跌破回站、確認破低。"""
@@ -2766,28 +2804,7 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         if alert_key in _alerted:
             continue
 
-        icon = "⚡" if signal == "假跌破回站" else "🟢" if signal == "守住昨低" else "❌"
-        title_kind = "買點" if signal == "假跌破回站" else "觀察" if signal == "守住昨低" else "風控"
-        if signal == "假跌破回站":
-            action = "可行動：這是本策略最強買點，可考慮進場；若同時放量紅K / 站回 VWAP，訊號更強"
-            stop = f"停損：再次跌破昨低 {prev_low:g}，或進場後跌破今低 {day_low:g}，立即出場"
-        elif signal == "守住昨低":
-            action = "可行動：可觀察分批試單，需確認站穩 VWAP / 5MA 或出現紅K承接"
-            stop = f"停損：跌破昨低 {prev_low:g} 或跌破昨低 1%（{break_level:g}）立即出場"
-        else:
-            action = "可行動：不進場；若已持有，今日出局，停止監測此股"
-            stop = "重新觀察條件：收盤重新站回昨低，且隔日不再破低"
-
-        msg = (
-            f"{icon} **隔日沖{title_kind}｜{signal}**\n"
-            f"{c['code']} {name}\n"
-            f"現價：{price:g} ｜ 昨低：{prev_low:g} ｜ 今低：{day_low:g}\n"
-            f"判斷：{note}\n"
-            f"{action}\n"
-            f"{stop}\n"
-            f"資料時間：{now.strftime('%H:%M')}\n"
-            f"推播時間：{now.strftime('%H:%M:%S')}"
-        )
+        msg = _build_pullback_discord_msg(c["code"], name, price, prev_low, day_low, break_level, signal, note, now)
         if send_discord(msg):
             _alerted.add(alert_key)
             pushed.append(c["code"])
@@ -2798,3 +2815,48 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         "pushed": pushed,
         "updated_at": now.strftime("%H:%M:%S"),
     }
+
+
+@app.post("/pullback_monitor/test_discord")
+async def test_pullback_monitor_discord(body: dict = None, x_token: str = Header(default=None)):
+    """測試隔日沖盤中監測 Discord 文案，不受盤中時間限制。"""
+    verify_token(x_token)
+    if not DISCORD_WEBHOOK:
+        return {"ok": False, "error": "DISCORD_WEBHOOK 環境變數未設定"}
+
+    body = body or {}
+    requested = str(body.get("signal", "all")).strip()
+    samples = {
+        "假跌破回站": {
+            "code": "2495", "name": "普安", "price": 40.85,
+            "prev_low": 39.05, "day_low": 38.10, "note": "最強買點，可考慮進場",
+        },
+        "守住昨低": {
+            "code": "3714", "name": "富采", "price": 64.90,
+            "prev_low": 65.40, "day_low": 62.50, "note": "可觀察分批試單",
+        },
+        "確認破低": {
+            "code": "3450", "name": "聯鈞", "price": 301.50,
+            "prev_low": 309.65, "day_low": 300.10, "note": "不進場；若已持有，今日出局",
+        },
+    }
+
+    selected = samples if requested == "all" else {requested: samples[requested]} if requested in samples else {}
+    if not selected:
+        return {"ok": False, "error": "signal 必須是 all、假跌破回站、守住昨低、確認破低"}
+
+    now = tw_now()
+    pushed = []
+    for signal, sample in selected.items():
+        prev_low = float(sample["prev_low"])
+        break_level = round(prev_low * 0.99, 2)
+        msg = _build_pullback_discord_msg(
+            sample["code"], sample["name"], float(sample["price"]), prev_low,
+            float(sample["day_low"]), break_level, signal, sample["note"], now, is_test=True
+        )
+        ok = await asyncio.to_thread(send_discord, msg)
+        if ok:
+            pushed.append(signal)
+        await asyncio.sleep(0.5)
+
+    return {"ok": len(pushed) == len(selected), "pushed": pushed, "webhook_set": True}
