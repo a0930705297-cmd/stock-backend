@@ -27,6 +27,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FUGLE_BASE        = "https://api.fugle.tw/marketdata/v1.0/stock"
 API_TOKEN         = os.environ.get("API_TOKEN", "0921")
 DISCORD_WEBHOOK   = os.environ.get("DISCORD_WEBHOOK", "")
+TW_TZ             = timezone(timedelta(hours=8))
 
 
 # 分析結果快取
@@ -62,6 +63,9 @@ def parse_int(s):
         return int(str(s).replace(",", "").replace(" ", "").strip())
     except Exception:
         return 0
+
+def tw_now():
+    return datetime.now(TW_TZ)
 
 INDUSTRY_THEME = {
     "半導體業":         ["半導體", "AI"],
@@ -236,7 +240,7 @@ async def get_ticker(symbol: str, x_token: str = Header(default=None)):
 @app.get("/foreign/{symbol}")
 async def get_foreign(symbol: str, x_token: str = Header(default=None)):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=730)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", symbol, start, end)
@@ -259,7 +263,7 @@ async def get_foreign(symbol: str, x_token: str = Header(default=None)):
 async def get_invest_trust(symbol: str, x_token: str = Header(default=None)):
     """投信買賣超，格式與 /foreign 相同，供前端計算投信加權成本"""
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=730)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", symbol, start, end)
@@ -281,7 +285,7 @@ async def get_invest_trust(symbol: str, x_token: str = Header(default=None)):
 @app.get("/margin/{symbol}")
 async def get_margin(symbol: str, x_token: str = Header(default=None)):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=730)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     rows = finmind_get("TaiwanStockMarginPurchaseShortSale", symbol, start, end)
@@ -302,7 +306,7 @@ async def get_margin(symbol: str, x_token: str = Header(default=None)):
 @app.get("/price/{symbol}")
 async def get_price(symbol: str, x_token: str = Header(default=None)):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=730)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
     rows = finmind_get("TaiwanStockPrice", symbol, start, end)
@@ -479,7 +483,7 @@ async def analyze(body: dict, x_token: str = Header(default=None)):
     cache_key = f"{stock_code}_{current_price}"
     if cache_key in analysis_cache:
         cached = analysis_cache[cache_key]
-        elapsed = (datetime.now() - cached["time"]).total_seconds() / 60
+        elapsed = (tw_now() - cached["time"]).total_seconds() / 60
         if elapsed < CACHE_MINUTES:
             print(f"快取命中：{cache_key}，距上次 {elapsed:.1f} 分鐘")
             return {"analysis": cached["text"], "cached": True}
@@ -550,7 +554,7 @@ async def analyze(body: dict, x_token: str = Header(default=None)):
         # 存入快取
         analysis_cache[cache_key] = {
             "text": text,
-            "time": datetime.now()
+            "time": tw_now()
         }
         print(f"新分析已快取：{cache_key}")
 
@@ -561,7 +565,7 @@ async def analyze(body: dict, x_token: str = Header(default=None)):
 @app.get("/revenue/{symbol}")
 async def get_revenue(symbol: str, x_token: str = Header(default=None)):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=760)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
 
@@ -590,7 +594,7 @@ async def get_revenue(symbol: str, x_token: str = Header(default=None)):
 @app.get("/market_volume")
 async def get_market_volume(x_token: str = Header(default=None)):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
     for i in range(5):
         try_date = (today - timedelta(days=i)).strftime("%Y%m%d")
         url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20?date={try_date}&response=json"
@@ -707,7 +711,7 @@ CUSTOM_THEME_STOCKS = {
 async def scan(body: dict, x_token: str = Header(default=None)):
     verify_token(x_token)
     codes = body.get("codes", [])
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=730)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
 
@@ -817,7 +821,7 @@ async def technical_scan(body: dict, x_token: str = Header(default=None)):
     top_n = body.get("top_n", 100)
 
     # 抓全市場當日成交資料
-    today = datetime.today()
+    today = tw_now()
     all_stocks = []
 
     for i in range(5):
@@ -1044,7 +1048,7 @@ def _parse_tpex_www(raw) -> list:
 async def get_emerging_analysis(x_token: str = Header(default=None)):
     verify_token(x_token)
 
-    today    = datetime.today()
+    today    = tw_now()
     start_90 = (today - timedelta(days=90)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
 
@@ -1128,7 +1132,7 @@ async def get_emerging_analysis(x_token: str = Header(default=None)):
 @app.get("/foreign_rank")
 async def get_foreign_rank(x_token: str = Header(default=None)):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
 
     for i in range(1, 8):
         d = (today - timedelta(days=i)).strftime("%Y%m%d")
@@ -1205,7 +1209,7 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     整合當日三大法人、融資融券、借券、當沖等籌碼資料
     """
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
 
     # ── 1. 三大法人（TWSE T86，最近交易日）───────
     institutional = {}
@@ -1403,7 +1407,7 @@ async def chip_scan(
     x_token: str = Header(default=None)
 ):
     verify_token(x_token)
-    today = datetime.today()
+    today = tw_now()
 
     code_list = [c.strip() for c in codes.split(",") if c.strip().isdigit()]
     if not code_list:
@@ -1575,7 +1579,7 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     """
     verify_token(x_token)
 
-    now = datetime.now()
+    now = tw_now()
     cached = _tick_cache.get(symbol)
     if cached and (now - cached["time"]).total_seconds() < _TICK_CACHE_SEC:
         return cached["data"]
@@ -1756,7 +1760,7 @@ _stock_list_fetched: str = ""     # 上次抓取日期
 def _get_stock_list() -> list:
     """抓上市＋上櫃股票清單（含產業、市場別）"""
     global _stock_list_cache, _stock_list_fetched
-    today = datetime.today().strftime("%Y-%m-%d")
+    today = tw_now().strftime("%Y-%m-%d")
     if _stock_list_cache and _stock_list_fetched == today:
         return _stock_list_cache
 
@@ -1803,18 +1807,18 @@ _flow_cache: dict = {}     # cache_key → result
 _prev_flow:  dict = {}     # 上一次的產業流向（用來算「較上次」）
 
 def _flow_cache_key() -> str:
-    now = datetime.now()
+    now = tw_now()
     slot = (now.hour * 60 + now.minute) // 3  # 3分鐘為單位
     return f"{now.date()}_{slot}"
 
 def _prev_cache_key() -> str:
-    now = datetime.now()
+    now = tw_now()
     slot = (now.hour * 60 + now.minute) // 3 - 1
     return f"{now.date()}_{max(slot,0)}"
 
 def _is_market_live(now: datetime | None = None) -> bool:
     """僅在台股盤中開放 Discord 自動推播。"""
-    now = now or datetime.now()
+    now = now or tw_now()
     if now.weekday() >= 5:
         return False
     minutes = now.hour * 60 + now.minute
@@ -2046,8 +2050,8 @@ async def flow_summary(x_token: str = Header(default=None)):
         "_stock_data": stock_data,
         "scanned":     len(stock_data),
         "elapsed_sec": elapsed,
-        "updated_at":  datetime.now().strftime("%H:%M"),
-        "data_date":   datetime.now().strftime("%Y-%m-%d"),
+        "updated_at":  tw_now().strftime("%H:%M"),
+        "data_date":   tw_now().strftime("%Y-%m-%d"),
         "cached":      False,
     }
 
@@ -2080,7 +2084,7 @@ async def flow_stock(code: str, x_token: str = Header(default=None)):
             latest = parsed
 
     # 歷史資料：FinMind 單股（免費版可用）
-    today = datetime.today()
+    today = tw_now()
     start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
     end   = today.strftime("%Y-%m-%d")
 
@@ -2156,7 +2160,7 @@ async def flow_stock(code: str, x_token: str = Header(default=None)):
         "belongs_to": belongs_to,
         "latest":     latest,
         "timeline":   timeline,
-        "updated_at": datetime.now().strftime("%H:%M"),
+        "updated_at": tw_now().strftime("%H:%M"),
     }
 
 
@@ -2228,7 +2232,7 @@ async def flow_industry(name: str, x_token: str = Header(default=None)):
         "out_amount": round(out_a, 2),
         "prev_change": None,
         "stocks":     stocks_out,
-        "updated_at": datetime.now().strftime("%H:%M"),
+        "updated_at": tw_now().strftime("%H:%M"),
     }
 
 
@@ -2299,7 +2303,7 @@ async def _check_and_alert(flow_result: dict, ind_thr: float, stock_thr: float):
     """
     ck = _flow_cache_key()
     alert_jobs = []
-    push_time = datetime.now()
+    push_time = tw_now()
     push_time_str = push_time.strftime("%H:%M:%S")
     data_time_str = flow_result.get("updated_at", "") or "—"
 
@@ -2389,7 +2393,7 @@ async def flow_monitor(
     """
     verify_token(x_token)
 
-    now = datetime.now()
+    now = tw_now()
 
     # 取最新快取（沒有就重新抓）
     ck = _flow_cache_key()
@@ -2423,8 +2427,8 @@ async def flow_monitor(
             "_stock_data": stock_data,
             "scanned":     len(stock_data),
             "elapsed_sec": elapsed,
-            "updated_at":  datetime.now().strftime("%H:%M"),
-            "data_date":   datetime.now().strftime("%Y-%m-%d"),
+            "updated_at":  tw_now().strftime("%H:%M"),
+            "data_date":   tw_now().strftime("%Y-%m-%d"),
             "cached":      False,
         }
         _flow_cache[ck] = flow_result
@@ -2468,7 +2472,7 @@ async def test_discord(x_token: str = Header(default=None)):
     verify_token(x_token)
     if not DISCORD_WEBHOOK:
         return {"ok": False, "error": "DISCORD_WEBHOOK 環境變數未設定"}
-    now = datetime.now()
+    now = tw_now()
     ok = await asyncio.to_thread(send_discord,
         f"✅ **股票雷達連線成功！**\n"
         f"資料時間：測試訊息\n"
