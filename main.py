@@ -1052,9 +1052,17 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
             prev_ma20 = ma_at(closes, 20, len(closes) - 1)
             prev_ma60 = ma_at(closes, 60, len(closes) - 1)
             avg_vol20 = ma_at(volumes, 20)
+            prev_row = price_rows[-2]
             today_open = float(price_rows[-1].get("open", closes[-1]) or closes[-1])
+            today_high = float(price_rows[-1].get("max", closes[-1]) or closes[-1])
+            today_low = float(price_rows[-1].get("min", closes[-1]) or closes[-1])
             today_close = closes[-1]
             today_volume = volumes[-1]
+            prev_low = float(prev_row.get("min", 0) or 0)
+            day_range = today_high - today_low
+            close_pos = round((today_close - today_low) / day_range, 2) if day_range > 0 else 0.5
+            close_pos = max(0, min(close_pos, 1))
+            candle = "紅K" if today_close >= today_open else "黑K"
 
             trend_ok = (
                 ma20 > ma60
@@ -1089,6 +1097,12 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                 signal_css = "neutral"
                 score = 1
 
+            if candle == "紅K":
+                score += 1
+            if close_pos < 0.3:
+                score -= 1
+            score = max(0, score)
+
             results.append({
                 "code": code,
                 "name": name,
@@ -1099,6 +1113,10 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                 "ma60": round(ma60, 1),
                 "ma20_gap_pct": ma20_gap_pct,
                 "vol_ratio": vol_ratio,
+                "candle": candle,
+                "close_pos": close_pos,
+                "close_pos_pct": round(close_pos * 100),
+                "prev_low": round(prev_low, 2),
                 "volume": item["volume"],
                 "signal": signal,
                 "signal_css": signal_css,
