@@ -1377,7 +1377,7 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
         "dealer_sell": 0,
     }
     history_rows = []
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         fut_inst = ex.submit(
             finmind_get,
             "TaiwanStockInstitutionalInvestorsBuySell",
@@ -1399,9 +1399,39 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
             start_10,
             end_date,
         )
+        fut_day_trade = ex.submit(
+            finmind_get,
+            "TaiwanStockDayTrading",
+            symbol,
+            start_10,
+            end_date,
+        )
+        fut_shareholding = ex.submit(
+            finmind_get,
+            "TaiwanStockShareholding",
+            symbol,
+            start_10,
+            end_date,
+        )
+        fut_short_bal = ex.submit(
+            finmind_get,
+            "TaiwanDailyShortSaleBalances",
+            symbol,
+            start_10,
+            end_date,
+        )
         inst_rows = fut_inst.result()
         price_rows = fut_price.result()
         margin_rows_raw = fut_margin.result()
+        day_trade_rows = fut_day_trade.result()
+        shareholding_rows = fut_shareholding.result()
+        short_bal_rows = fut_short_bal.result()
+
+    def to_int(value, default=0):
+        try:
+            return int(float(str(value).replace(",", "").strip()))
+        except Exception:
+            return default
 
     # ── 2. 近10日三大法人歷史（FinMind）──────────
     hist_map = {}
@@ -1485,11 +1515,36 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     latest_price  = float(latest_price_row.get("close", 0))
     latest_volume = int(latest_price_row.get("Trading_Volume", 0)) // 1000
 
-    # ── 5. 當沖率 ────────────────────────────────
-    # TWSE STOCK_DAY 沒有當沖量欄位，不能用成交金額推算。
-    # 正確資料源待補 FinMind TaiwanStockDayTrading；目前回傳 None 讓前端顯示「—」。
+    # ── 5. 當沖率（FinMind TaiwanStockDayTrading）────────
     day_trade_vol = None
     day_trade_ratio = None
+    if day_trade_rows:
+        latest_day_trade = sorted(day_trade_rows, key=lambda x: x.get("date", ""))[-1]
+        raw_day_trade_vol = to_int(latest_day_trade.get("Volume"), 0)
+        day_trade_vol = raw_day_trade_vol // 1000
+        day_trade_ratio = round(day_trade_vol / latest_volume * 100, 2) if latest_volume > 0 else None
+
+    # ── 6. 周轉率（FinMind TaiwanStockShareholding）───────
+    turnover_rate = None
+    if shareholding_rows:
+        latest_shareholding = sorted(shareholding_rows, key=lambda x: x.get("date", ""))[-1]
+        issued_shares = to_int(
+            latest_shareholding.get("NumberOfSharesIssued")
+            or latest_shareholding.get("number_of_shares_issued"),
+            0,
+        )
+        issued_lots = issued_shares // 1000
+        turnover_rate = round(latest_volume / issued_lots * 100, 2) if issued_lots > 0 else None
+
+    # ── 7. 借券賣出餘額（FinMind TaiwanDailyShortSaleBalances）──
+    borrow_sell_change = None
+    borrow_sell_balance = None
+    if short_bal_rows:
+        latest_short_bal = sorted(short_bal_rows, key=lambda x: x.get("date", ""))[-1]
+        sbl_prev = to_int(latest_short_bal.get("SBLShortSalesPreviousDayBalance"), 0)
+        sbl_current = to_int(latest_short_bal.get("SBLShortSalesCurrentDayBalance"), 0)
+        borrow_sell_balance = sbl_current // 1000
+        borrow_sell_change = int((sbl_current - sbl_prev) / 1000)
 
     # ── 組合今日籌碼 ─────────────────────────────
     data_out = {
@@ -1503,6 +1558,9 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
         "short_margin_ratio": latest_margin.get("short_margin_ratio", 0),
         "day_trade_volume": day_trade_vol,
         "day_trade_ratio":  day_trade_ratio,
+        "turnover_rate": turnover_rate,
+        "borrow_sell_change": borrow_sell_change,
+        "borrow_sell_balance": borrow_sell_balance,
         # 主力 = 外資+投信（簡化）
         "main_net": (institutional.get("foreign_net", 0) + institutional.get("invest_trust_net", 0)),
         # 三大法人合計
