@@ -1503,22 +1503,11 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     latest_price  = float(latest_price_row.get("close", 0))
     latest_volume = int(latest_price_row.get("Trading_Volume", 0)) // 1000
 
-    # ── 5. 當沖率（TWSE）──────────────────────────
-    day_trade_vol   = 0
-    day_trade_ratio = 0.0
-    for i in range(1, 6):
-        d = (today - timedelta(days=i)).strftime("%Y%m%d")
-        dt_url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date={d}&stockNo={symbol}&response=json"
-        dt_data = twse_get(dt_url)
-        if dt_data and dt_data.get("stat") == "OK" and dt_data.get("data"):
-            last = dt_data["data"][-1]
-            try:
-                day_trade_vol = int(str(last[2]).replace(",","")) // 1000
-                vol_total     = int(str(last[1]).replace(",","")) // 1000
-                day_trade_ratio = round(day_trade_vol / vol_total * 100, 2) if vol_total > 0 else 0
-            except Exception:
-                pass
-            break
+    # ── 5. 當沖率 ────────────────────────────────
+    # TWSE STOCK_DAY 沒有當沖量欄位，不能用成交金額推算。
+    # 正確資料源待補 FinMind TaiwanStockDayTrading；目前回傳 None 讓前端顯示「—」。
+    day_trade_vol = None
+    day_trade_ratio = None
 
     # ── 組合今日籌碼 ─────────────────────────────
     data_out = {
