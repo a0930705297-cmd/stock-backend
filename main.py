@@ -2661,3 +2661,136 @@ async def test_discord(x_token: str = Header(default=None)):
         f"產業流入門檻：20億　個股流入門檻：5億"
     )
     return {"ok": ok, "webhook_set": True}
+
+
+@app.post("/pullback_monitor")
+async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
+    """盤中監測隔日沖候選：守昨低、假跌破回站、確認破低。"""
+    verify_token(x_token)
+    candidates = body.get("candidates", []) or []
+    now = tw_now()
+    minutes = now.hour * 60 + now.minute
+
+    clean = []
+    for c in candidates[:50]:
+        code = str(c.get("code", "")).strip()
+        if not code.isdigit() or len(code) != 4:
+            continue
+        try:
+            prev_low = float(c.get("prev_low", 0) or 0)
+        except Exception:
+            prev_low = 0
+        if prev_low <= 0:
+            continue
+        market = str(c.get("market", "tse")).lower()
+        clean.append({
+            "code": code,
+            "name": str(c.get("name", code)).strip() or code,
+            "market": "otc" if market == "otc" else "tse",
+            "prev_low": prev_low,
+        })
+
+    if not clean:
+        return {"results": [], "market_live": _is_market_live(now), "pushed": [], "updated_at": now.strftime("%H:%M:%S")}
+
+    symbols = [_mis_symbol(c["code"], c["market"]) for c in clean]
+    rows = _fetch_mis_batch(symbols)
+    row_map = {}
+    for row in rows:
+        code = str(row.get("c", row.get("@", "").split(".")[0].replace("tse_", "").replace("otc_", ""))).strip()
+        if code:
+            row_map[code] = row
+
+    results = []
+    pushed = []
+    market_live = _is_market_live(now)
+
+    for c in clean:
+        row = row_map.get(c["code"], {})
+        try:
+            price = float(str(row.get("z", "0") or "0").replace(",", ""))
+        except Exception:
+            price = 0
+        try:
+            day_low = float(str(row.get("l", "0") or "0").replace(",", ""))
+        except Exception:
+            day_low = 0
+        if day_low <= 0:
+            day_low = price
+        if price <= 0:
+            continue
+
+        prev_low = c["prev_low"]
+        name = str(row.get("n", c["name"])).strip() or c["name"]
+        break_level = round(prev_low * 0.99, 2)
+
+        if price < break_level:
+            signal = "確認破低"
+            signal_type = "red"
+            note = "不進場；若已持有，今日出局"
+        elif day_low < prev_low and price >= prev_low:
+            signal = "假跌破回站"
+            signal_type = "yellow"
+            note = "最強買點，可考慮進場"
+        elif price >= prev_low and minutes >= 570:
+            signal = "守住昨低"
+            signal_type = "green"
+            note = "可觀察分批試單"
+        else:
+            signal = "盤中觀察"
+            signal_type = "neutral"
+            note = "等待 09:30 後確認"
+
+        result = {
+            "code": c["code"],
+            "name": name,
+            "price": price,
+            "day_low": day_low,
+            "prev_low": prev_low,
+            "break_level": break_level,
+            "signal": signal,
+            "signal_type": signal_type,
+            "note": note,
+        }
+        results.append(result)
+
+        if not market_live or signal_type == "neutral":
+            continue
+
+        slot = _flow_cache_key()
+        alert_key = f"pullback_{signal}_{c['code']}_{slot if signal == '守住昨低' else now.date()}"
+        if alert_key in _alerted:
+            continue
+
+        icon = "⚡" if signal == "假跌破回站" else "🟢" if signal == "守住昨低" else "❌"
+        title_kind = "買點" if signal == "假跌破回站" else "觀察" if signal == "守住昨低" else "風控"
+        if signal == "假跌破回站":
+            action = "可行動：這是本策略最強買點，可考慮進場；若同時放量紅K / 站回 VWAP，訊號更強"
+            stop = f"停損：再次跌破昨低 {prev_low:g}，或進場後跌破今低 {day_low:g}，立即出場"
+        elif signal == "守住昨低":
+            action = "可行動：可觀察分批試單，需確認站穩 VWAP / 5MA 或出現紅K承接"
+            stop = f"停損：跌破昨低 {prev_low:g} 或跌破昨低 1%（{break_level:g}）立即出場"
+        else:
+            action = "可行動：不進場；若已持有，今日出局，停止監測此股"
+            stop = "重新觀察條件：收盤重新站回昨低，且隔日不再破低"
+
+        msg = (
+            f"{icon} **隔日沖{title_kind}｜{signal}**\n"
+            f"{c['code']} {name}\n"
+            f"現價：{price:g} ｜ 昨低：{prev_low:g} ｜ 今低：{day_low:g}\n"
+            f"判斷：{note}\n"
+            f"{action}\n"
+            f"{stop}\n"
+            f"資料時間：{now.strftime('%H:%M')}\n"
+            f"推播時間：{now.strftime('%H:%M:%S')}"
+        )
+        if send_discord(msg):
+            _alerted.add(alert_key)
+            pushed.append(c["code"])
+
+    return {
+        "results": results,
+        "market_live": market_live,
+        "pushed": pushed,
+        "updated_at": now.strftime("%H:%M:%S"),
+    }
