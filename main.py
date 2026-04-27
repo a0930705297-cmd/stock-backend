@@ -999,6 +999,8 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                     close = float(str(row[7]).replace(",", "")) if row[7] else 0
                     if not code.isdigit() or volume <= 0 or close <= 0:
                         continue
+                    if code.startswith("0") or len(code) != 4:
+                        continue
                     all_stocks.append({
                         "code": code,
                         "name": name,
