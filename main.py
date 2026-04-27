@@ -978,6 +978,139 @@ async def technical_scan(body: dict, x_token: str = Header(default=None)):
     results.sort(key=lambda x: x["volume"], reverse=True)
     return {"data": results}
 
+@app.post("/pullback_scan")
+async def pullback_scan(body: dict, x_token: str = Header(default=None)):
+    verify_token(x_token)
+    top_n = body.get("top_n", 100)
+
+    today = tw_now()
+    all_stocks = []
+
+    for i in range(5):
+        try_date = (today - timedelta(days=i)).strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&date={try_date}"
+        data = twse_get(url)
+        if data and data.get("stat") == "OK" and data.get("data"):
+            for row in data["data"]:
+                try:
+                    code = str(row[0]).strip()
+                    name = str(row[1]).strip()
+                    volume = int(str(row[2]).replace(",", "")) if row[2] else 0
+                    close = float(str(row[7]).replace(",", "")) if row[7] else 0
+                    if not code.isdigit() or volume <= 0 or close <= 0:
+                        continue
+                    all_stocks.append({
+                        "code": code,
+                        "name": name,
+                        "close": close,
+                        "volume": volume
+                    })
+                except Exception:
+                    continue
+            break
+
+    if not all_stocks:
+        return {"data": [], "error": "無法取得當日成交資料"}
+
+    all_stocks.sort(key=lambda x: x["volume"], reverse=True)
+    target_stocks = all_stocks[:top_n]
+
+    results = []
+    start_date = (today - timedelta(days=140)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
+
+    def ma_at(values, n, end_idx=None):
+        if end_idx is None:
+            end_idx = len(values)
+        start_idx = end_idx - n
+        if start_idx < 0:
+            return 0
+        return sum(values[start_idx:end_idx]) / n
+
+    for item in target_stocks:
+        code = item["code"]
+        name = item["name"]
+        close = item["close"]
+
+        try:
+            price_rows = finmind_get("TaiwanStockPrice", code, start_date, end_date)
+            if len(price_rows) < 65:
+                continue
+
+            price_rows = sorted(price_rows, key=lambda x: x.get("date", ""))
+            closes = [float(r.get("close", 0)) for r in price_rows]
+            volumes = [int(r.get("Trading_Volume", 0)) for r in price_rows]
+            if len(closes) < 65 or closes[-1] <= 0:
+                continue
+
+            ma5 = ma_at(closes, 5)
+            ma10 = ma_at(closes, 10)
+            ma20 = ma_at(closes, 20)
+            ma60 = ma_at(closes, 60)
+            prev_ma5 = ma_at(closes, 5, len(closes) - 1)
+            prev_ma10 = ma_at(closes, 10, len(closes) - 1)
+            prev_ma20 = ma_at(closes, 20, len(closes) - 1)
+            prev_ma60 = ma_at(closes, 60, len(closes) - 1)
+            avg_vol20 = ma_at(volumes, 20)
+            today_open = float(price_rows[-1].get("open", closes[-1]) or closes[-1])
+            today_close = closes[-1]
+            today_volume = volumes[-1]
+
+            trend_ok = (
+                ma20 > ma60
+                and ma20 >= prev_ma20
+                and ma60 >= prev_ma60
+                and today_close > ma60
+            )
+            cross_down = prev_ma5 >= prev_ma10 and ma5 < ma10
+            heavy_black = today_close < today_open and today_volume > avg_vol20
+            controlled_pullback = (
+                (avg_vol20 <= 0 or today_volume <= avg_vol20)
+                and not heavy_black
+            )
+            not_breakdown = today_close >= ma20 * 0.96
+
+            if not (trend_ok and cross_down and controlled_pullback and not_breakdown):
+                continue
+
+            ma20_gap_pct = round((today_close - ma20) / ma20 * 100, 2) if ma20 > 0 else 0
+            vol_ratio = round(today_volume / avg_vol20, 2) if avg_vol20 > 0 else 0
+
+            if abs(ma20_gap_pct) <= 2:
+                signal = "貼近20MA"
+                signal_css = "good"
+                score = 3
+            elif ma20_gap_pct > 2:
+                signal = "等回測"
+                signal_css = "warning"
+                score = 2
+            else:
+                signal = "弱觀察"
+                signal_css = "neutral"
+                score = 1
+
+            results.append({
+                "code": code,
+                "name": name,
+                "close": close,
+                "ma5": round(ma5, 1),
+                "ma10": round(ma10, 1),
+                "ma20": round(ma20, 1),
+                "ma60": round(ma60, 1),
+                "ma20_gap_pct": ma20_gap_pct,
+                "vol_ratio": vol_ratio,
+                "volume": item["volume"],
+                "signal": signal,
+                "signal_css": signal_css,
+                "score": score
+            })
+
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: (x["score"], -abs(x["ma20_gap_pct"])), reverse=True)
+    return {"data": results}
+
 # ── 共用工具函式（興櫃分析用）────────────
 def _pf(v) -> float:
     try:
