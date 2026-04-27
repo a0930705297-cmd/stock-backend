@@ -2724,7 +2724,11 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         name = str(row.get("n", c["name"])).strip() or c["name"]
         break_level = round(prev_low * 0.99, 2)
 
-        if price < break_level:
+        if not market_live:
+            signal = "非盤中"
+            signal_type = "neutral"
+            note = "非盤中時段，只顯示參考價；09:00-13:30 才判斷入場訊號"
+        elif price < break_level:
             signal = "確認破低"
             signal_type = "red"
             note = "不進場；若已持有，今日出局"
