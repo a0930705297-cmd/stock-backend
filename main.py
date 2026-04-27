@@ -978,6 +978,39 @@ async def technical_scan(body: dict, x_token: str = Header(default=None)):
     results.sort(key=lambda x: x["volume"], reverse=True)
     return {"data": results}
 
+def _calc_foreign_cost_from_rows(foreign_rows: list, price_rows: list) -> float:
+    price_map = {}
+    for row in price_rows:
+        try:
+            date_key = str(row.get("date", "")).replace("-", "")
+            price_map[date_key] = float(row.get("close", 0) or 0)
+        except Exception:
+            continue
+
+    holdings = 0
+    total_cost = 0
+    for row in foreign_rows:
+        try:
+            if row.get("name") != "Foreign_Investor":
+                continue
+            date_key = str(row.get("date", "")).replace("-", "")
+            price = price_map.get(date_key, 0)
+            if price <= 0:
+                continue
+            buy = max(int(float(row.get("buy", 0) or 0)), 0) // 1000
+            sell = max(int(float(row.get("sell", 0) or 0)), 0) // 1000
+            if buy > 0:
+                total_cost += buy * 1000 * price
+                holdings += buy * 1000
+            if sell > 0 and holdings > 0:
+                sold = min(sell * 1000, holdings)
+                total_cost -= sold * (total_cost / holdings)
+                holdings -= sold
+        except Exception:
+            continue
+
+    return total_cost / holdings if holdings > 0 else 0
+
 @app.post("/pullback_scan")
 async def pullback_scan(body: dict, x_token: str = Header(default=None)):
     verify_token(x_token)
@@ -1069,6 +1102,7 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
             trend_ok = (
                 ma20 > ma60
                 and ma20 >= prev_ma20
+                and ma10 >= prev_ma10
                 and ma60 >= prev_ma60
                 and today_close > ma60
             )
@@ -1085,6 +1119,29 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
 
             ma20_gap_pct = round((today_close - ma20) / ma20 * 100, 2) if ma20 > 0 else 0
             vol_ratio = round(today_volume / avg_vol20, 2) if avg_vol20 > 0 else 0
+            foreign_cost = 0
+            foreign_cost_gap_pct = None
+            foreign_cost_label = ""
+            foreign_cost_css = ""
+
+            try:
+                foreign_rows = finmind_get(
+                    "TaiwanStockInstitutionalInvestorsBuySell", code, start_date, end_date
+                )
+                foreign_cost = _calc_foreign_cost_from_rows(foreign_rows, price_rows)
+                if foreign_cost > 0:
+                    foreign_cost_gap_pct = round((today_close - foreign_cost) / foreign_cost * 100, 2)
+                    if abs(foreign_cost_gap_pct) <= 5:
+                        foreign_cost_label = "法人成本支撐"
+                        foreign_cost_css = "good"
+                    elif -10 <= foreign_cost_gap_pct < -5:
+                        foreign_cost_label = "成本破位"
+                        foreign_cost_css = "warning"
+                    elif foreign_cost_gap_pct < -10:
+                        foreign_cost_label = "成本深破"
+                        foreign_cost_css = "danger"
+            except Exception:
+                foreign_cost = 0
 
             if abs(ma20_gap_pct) <= 2:
                 signal = "貼近20MA"
@@ -1119,6 +1176,10 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                 "close_pos": close_pos,
                 "close_pos_pct": round(close_pos * 100),
                 "prev_low": round(prev_low, 2),
+                "foreign_cost": round(foreign_cost, 1) if foreign_cost > 0 else 0,
+                "foreign_cost_gap_pct": foreign_cost_gap_pct,
+                "foreign_cost_label": foreign_cost_label,
+                "foreign_cost_css": foreign_cost_css,
                 "volume": item["volume"],
                 "signal": signal,
                 "signal_css": signal_css,
@@ -2682,11 +2743,14 @@ def _build_pullback_discord_msg(
     test_prefix = "【測試】" if is_test else ""
 
     if signal == "假跌破回站":
-        action = "可行動：這是本策略最強買點，可考慮進場；若同時放量紅K / 站回 VWAP，訊號更強"
+        action = "可行動：這是本策略最強買點，但不是無條件追價；需確認站回 VWAP / 5MA，或出現紅K承接後再試單"
         stop = f"停損：再次跌破昨低 {prev_low:g}，或進場後跌破今低 {day_low:g}，立即出場"
     elif signal == "守住昨低":
-        action = "可行動：可觀察分批試單，需確認站穩 VWAP / 5MA 或出現紅K承接"
+        action = "可行動：先觀察，不急著追；需確認站穩 VWAP / 5MA，或出現紅K承接後再分批試單"
         stop = f"停損：跌破昨低 {prev_low:g} 或跌破昨低 1%（{break_level:g}）立即出場"
+    elif signal == "跳空破低":
+        action = "可行動：不進場；若已持有，不等盤中確認，優先風控出場"
+        stop = "重新觀察條件：收盤重新站回昨低，且隔日不再破低"
     else:
         action = "可行動：不進場；若已持有，今日出局，停止監測此股"
         stop = "重新觀察條件：收盤重新站回昨低，且隔日不再破低"
@@ -2698,6 +2762,7 @@ def _build_pullback_discord_msg(
         f"判斷：{note}\n"
         f"{action}\n"
         f"{stop}\n"
+        f"交易限制：此訊號需能盤中停損；零股無法當沖，僅建議紙上交易測試\n"
         f"資料時間：{now.strftime('%H:%M')}\n"
         f"推播時間：{now.strftime('%H:%M:%S')}"
     )
@@ -2768,6 +2833,10 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
             signal = "非盤中"
             signal_type = "neutral"
             note = "非盤中時段，只顯示參考價；09:00-13:30 才判斷入場訊號"
+        elif minutes <= 545 and price < break_level:
+            signal = "跳空破低"
+            signal_type = "red"
+            note = "開盤跳空跌破昨低，直接風控出場"
         elif price < break_level:
             signal = "確認破低"
             signal_type = "red"
@@ -2841,11 +2910,15 @@ async def test_pullback_monitor_discord(body: dict = None, x_token: str = Header
             "code": "3450", "name": "聯鈞", "price": 301.50,
             "prev_low": 309.65, "day_low": 300.10, "note": "不進場；若已持有，今日出局",
         },
+        "跳空破低": {
+            "code": "1802", "name": "台玻", "price": 61.20,
+            "prev_low": 63.10, "day_low": 61.00, "note": "開盤跳空跌破昨低，直接風控出場",
+        },
     }
 
     selected = samples if requested == "all" else {requested: samples[requested]} if requested in samples else {}
     if not selected:
-        return {"ok": False, "error": "signal 必須是 all、假跌破回站、守住昨低、確認破低"}
+        return {"ok": False, "error": "signal 必須是 all、假跌破回站、守住昨低、確認破低、跳空破低"}
 
     now = tw_now()
     pushed = []
