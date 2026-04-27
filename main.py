@@ -1361,123 +1361,108 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     """
     verify_token(x_token)
     today = tw_now()
+    start_10 = (today - timedelta(days=20)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
 
-    # ── 1. 三大法人（TWSE T86，最近交易日）───────
-    institutional = {}
+    # ── 1. 並行抓取 FinMind 資料，避免籌碼頁等待多個外部請求串行逾時 ─────
+    institutional = {
+        "foreign_net": 0,
+        "foreign_buy": 0,
+        "foreign_sell": 0,
+        "invest_trust_net": 0,
+        "invest_trust_buy": 0,
+        "invest_trust_sell": 0,
+        "dealer_net": 0,
+        "dealer_buy": 0,
+        "dealer_sell": 0,
+    }
     history_rows = []
-    for i in range(1, 8):
-        d = (today - timedelta(days=i)).strftime("%Y%m%d")
-        url = f"https://www.twse.com.tw/rwd/zh/fund/T86?response=json&date={d}&selectType=ALL"
-        data = twse_get(url)
-        if not data or data.get("stat") != "OK":
-            continue
-        fields = data.get("fields", [])
-        rows   = data.get("data", [])
-
-        def fi(candidates, default):
-            for name in candidates:
-                if name in fields:
-                    return fields.index(name)
-            return default
-
-        idx_code   = fi(["證券代號"], 0)
-        idx_name   = fi(["證券名稱"], 1)
-        idx_fbuy   = fi(["外陸資買進股數(不含外資自營商)", "外陸資買進股數"], 2)
-        idx_fsell  = fi(["外陸資賣出股數(不含外資自營商)", "外陸資賣出股數"], 3)
-        idx_fnet   = fi(["外陸資買賣超股數(不含外資自營商)", "外陸資買賣超股數"], 4)
-        idx_itbuy  = fi(["投信買進股數"], 8)
-        idx_itsell = fi(["投信賣出股數"], 9)
-        idx_itnet  = fi(["投信買賣超股數"], 10)
-        idx_dbuy   = fi(["自營商買進股數(自行買賣)", "自營商買進股數"], 12)
-        idx_dsell  = fi(["自營商賣出股數(自行買賣)", "自營商賣出股數"], 13)
-        idx_dnet   = fi(["自營商買賣超股數(自行買賣)", "自營商買賣超股數"], 11)
-
-        def pn(s):
-            try: return int(str(s).replace(",","").strip()) // 1000
-            except: return 0
-
-        for row in rows:
-            try:
-                if str(row[idx_code]).strip() != symbol:
-                    continue
-                institutional = {
-                    "foreign_net":      pn(row[idx_fnet]),
-                    "foreign_buy":      pn(row[idx_fbuy]),
-                    "foreign_sell":     pn(row[idx_fsell]),
-                    "invest_trust_net": pn(row[idx_itnet]),
-                    "invest_trust_buy": pn(row[idx_itbuy]),
-                    "invest_trust_sell":pn(row[idx_itsell]),
-                    "dealer_net":       pn(row[idx_dnet]),
-                    "dealer_buy":       pn(row[idx_dbuy]),
-                    "dealer_sell":      pn(row[idx_dsell]),
-                }
-                break
-            except Exception:
-                continue
-        if institutional:
-            break
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fut_inst = ex.submit(
+            finmind_get,
+            "TaiwanStockInstitutionalInvestorsBuySell",
+            symbol,
+            start_10,
+            end_date,
+        )
+        fut_price = ex.submit(
+            finmind_get,
+            "TaiwanStockPrice",
+            symbol,
+            start_10,
+            end_date,
+        )
+        fut_margin = ex.submit(
+            finmind_get,
+            "TaiwanStockMarginPurchaseShortSale",
+            symbol,
+            start_10,
+            end_date,
+        )
+        inst_rows = fut_inst.result()
+        price_rows = fut_price.result()
+        margin_rows_raw = fut_margin.result()
 
     # ── 2. 近10日三大法人歷史（FinMind）──────────
-    start_10 = (today - timedelta(days=20)).strftime("%Y-%m-%d")
-    end_date  = today.strftime("%Y-%m-%d")
-    inst_rows = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", symbol, start_10, end_date)
     hist_map = {}
     for r in inst_rows:
         date_key = r["date"]
         if date_key not in hist_map:
-            hist_map[date_key] = {"date": date_key, "foreign_net": 0, "invest_trust_net": 0, "dealer_net": 0}
+            hist_map[date_key] = {
+                "date": date_key,
+                "foreign_net": 0,
+                "foreign_buy": 0,
+                "foreign_sell": 0,
+                "invest_trust_net": 0,
+                "invest_trust_buy": 0,
+                "invest_trust_sell": 0,
+                "dealer_net": 0,
+                "dealer_buy": 0,
+                "dealer_sell": 0,
+            }
         buy  = max(int(r.get("buy",  0)), 0) // 1000
         sell = max(int(r.get("sell", 0)), 0) // 1000
         net  = buy - sell
         name = r.get("name", "")
         if name == "Foreign_Investor":
             hist_map[date_key]["foreign_net"] = net
+            hist_map[date_key]["foreign_buy"] = buy
+            hist_map[date_key]["foreign_sell"] = sell
         elif name == "Investment_Trust":
             hist_map[date_key]["invest_trust_net"] = net
+            hist_map[date_key]["invest_trust_buy"] = buy
+            hist_map[date_key]["invest_trust_sell"] = sell
         elif name == "Dealer_self":
             hist_map[date_key]["dealer_net"] = net
+            hist_map[date_key]["dealer_buy"] = buy
+            hist_map[date_key]["dealer_sell"] = sell
 
     # ── 加上收盤價 ──────────────────────────────
-    price_rows = finmind_get("TaiwanStockPrice", symbol, start_10, end_date)
     price_map = {r["date"]: float(r.get("close", 0)) for r in price_rows}
     for date_key, row in hist_map.items():
         row["close"] = price_map.get(date_key, 0)
 
     history_rows = sorted(hist_map.values(), key=lambda x: x["date"])
 
-    # ── 優先用 FinMind 最新一筆的 net，buy/sell 保留 T86 ──
-    # FinMind 只有 net，T86 有 buy/sell/net
-    # 策略：若 FinMind 最新日期 >= T86 日期，用 FinMind net 覆蓋 net，buy/sell 保留 T86
+    # ── 優先用 FinMind 最新一筆的 net ───────────
+    # FinMind 已可提供 buy/sell/net；若沒有拆分欄位則保留預設 0。
     latest_inst_date = ""
     if history_rows:
         latest_hist      = history_rows[-1]
         latest_inst_date = latest_hist["date"]
-        fm_date_str      = latest_inst_date.replace("-", "")
-
-        # 取 T86 的 buy/sell（若有的話）
-        t86_fbuy  = institutional.get("foreign_buy",       0)
-        t86_fsell = institutional.get("foreign_sell",      0)
-        t86_itbuy = institutional.get("invest_trust_buy",  0)
-        t86_itsell= institutional.get("invest_trust_sell", 0)
-        t86_dbuy  = institutional.get("dealer_buy",        0)
-        t86_dsell = institutional.get("dealer_sell",       0)
-
         institutional = {
-            # net 優先用 FinMind（較新）
             "foreign_net":       latest_hist.get("foreign_net", institutional.get("foreign_net", 0)),
             "invest_trust_net":  latest_hist.get("invest_trust_net", institutional.get("invest_trust_net", 0)),
             "dealer_net":        latest_hist.get("dealer_net", institutional.get("dealer_net", 0)),
-            # buy/sell 保留 T86 的值（FinMind 歷史沒有拆分）
-            "foreign_buy":       t86_fbuy,
-            "foreign_sell":      t86_fsell,
-            "invest_trust_buy":  t86_itbuy,
-            "invest_trust_sell": t86_itsell,
-            "dealer_buy":        t86_dbuy,
-            "dealer_sell":       t86_dsell,
+            "foreign_buy":       latest_hist.get("foreign_buy", institutional.get("foreign_buy", 0)),
+            "foreign_sell":      latest_hist.get("foreign_sell", institutional.get("foreign_sell", 0)),
+            "invest_trust_buy":  latest_hist.get("invest_trust_buy", institutional.get("invest_trust_buy", 0)),
+            "invest_trust_sell": latest_hist.get("invest_trust_sell", institutional.get("invest_trust_sell", 0)),
+            "dealer_buy":        latest_hist.get("dealer_buy", institutional.get("dealer_buy", 0)),
+            "dealer_sell":       latest_hist.get("dealer_sell", institutional.get("dealer_sell", 0)),
         }
 
     # ── 3. 融資融券（FinMind）────────────────────
-    margin_rows_raw = finmind_get("TaiwanStockMarginPurchaseShortSale", symbol, start_10, end_date)
     margin_history = []
     for r in margin_rows_raw:
         mb  = int(r.get("MarginPurchaseTodayBalance", 0))
@@ -1496,10 +1481,7 @@ async def get_chips(symbol: str, x_token: str = Header(default=None)):
     latest_margin = margin_history[-1] if margin_history else {}
 
     # ── 4. 當日股價與成交量（FinMind）─────────────
-    price_today_rows = finmind_get("TaiwanStockPrice", symbol,
-                                   (today - timedelta(days=5)).strftime("%Y-%m-%d"),
-                                   end_date)
-    latest_price_row = price_today_rows[-1] if price_today_rows else {}
+    latest_price_row = price_rows[-1] if price_rows else {}
     latest_price  = float(latest_price_row.get("close", 0))
     latest_volume = int(latest_price_row.get("Trading_Volume", 0)) // 1000
 
