@@ -1058,6 +1058,7 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                     code = str(row[0]).strip()
                     name = str(row[1]).strip()
                     volume = int(str(row[2]).replace(",", "")) if row[2] else 0
+                    amount = int(str(row[3]).replace(",", "")) if len(row) > 3 and row[3] else 0
                     close = float(str(row[7]).replace(",", "")) if row[7] else 0
                     if not code.isdigit() or volume <= 0 or close <= 0:
                         continue
@@ -1065,11 +1066,17 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                         continue
                     if code in disposal_codes:
                         continue
+                    if amount <= 0:
+                        amount = int(volume * close)
+                    if close < 20 or amount < 100_000_000:
+                        continue
                     all_stocks.append({
                         "code": code,
                         "name": name,
                         "close": close,
-                        "volume": volume
+                        "volume": volume,
+                        "amount": amount,
+                        "amount_yi": round(amount / 100_000_000, 2),
                     })
                 except Exception:
                     continue
@@ -1078,7 +1085,7 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
     if not all_stocks:
         return {"data": [], "error": "無法取得當日成交資料"}
 
-    all_stocks.sort(key=lambda x: x["volume"], reverse=True)
+    all_stocks.sort(key=lambda x: x["amount"], reverse=True)
     target_stocks = all_stocks[:top_n]
 
     results = []
@@ -1212,6 +1219,8 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                 "foreign_cost_label": foreign_cost_label,
                 "foreign_cost_css": foreign_cost_css,
                 "volume": item["volume"],
+                "amount": item["amount"],
+                "amount_yi": item["amount_yi"],
                 "signal": signal,
                 "signal_css": signal_css,
                 "score": score
