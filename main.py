@@ -1011,6 +1011,34 @@ def _calc_foreign_cost_from_rows(foreign_rows: list, price_rows: list) -> float:
 
     return total_cost / holdings if holdings > 0 else 0
 
+_disposal_cache = {"codes": set(), "ts": 0}
+
+def _fetch_disposal_stocks() -> set:
+    """取得 TWSE 處置股 / 警示股清單，快取 30 分鐘。"""
+    now_ts = _time.time()
+    if _disposal_cache["codes"] and now_ts - _disposal_cache["ts"] < 1800:
+        return _disposal_cache["codes"]
+
+    codes = set()
+    urls = [
+        "https://www.twse.com.tw/rwd/zh/announcement/punish?response=json",
+        "https://www.twse.com.tw/rwd/zh/announcement/warning?response=json",
+    ]
+    for url in urls:
+        data = twse_get(url)
+        if not data or not data.get("data"):
+            continue
+        for row in data.get("data", []):
+            for cell in row[:4]:
+                code = str(cell).strip()
+                if code.isdigit() and len(code) == 4 and not code.startswith("0"):
+                    codes.add(code)
+                    break
+
+    _disposal_cache["codes"] = codes
+    _disposal_cache["ts"] = now_ts
+    return codes
+
 @app.post("/pullback_scan")
 async def pullback_scan(body: dict, x_token: str = Header(default=None)):
     verify_token(x_token)
@@ -1018,6 +1046,7 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
 
     today = tw_now()
     all_stocks = []
+    disposal_codes = _fetch_disposal_stocks()
 
     for i in range(5):
         try_date = (today - timedelta(days=i)).strftime("%Y%m%d")
@@ -1033,6 +1062,8 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                     if not code.isdigit() or volume <= 0 or close <= 0:
                         continue
                     if code.startswith("0") or len(code) != 4:
+                        continue
+                    if code in disposal_codes:
                         continue
                     all_stocks.append({
                         "code": code,
@@ -2505,6 +2536,7 @@ async def flow_status(x_token: str = Header(default=None)):
 # 已推播記錄（避免同一個訊號重複推播）
 # key = "產業名稱_cache_key" or "股票代號_cache_key"
 _alerted: set = set()
+_monitor_discord_enabled = True
 
 def _fmt_yi(v: float) -> str:
     """格式化億元"""
@@ -2775,8 +2807,10 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
     candidates = body.get("candidates", []) or []
     now = tw_now()
     minutes = now.hour * 60 + now.minute
+    disposal_codes = _fetch_disposal_stocks()
 
     clean = []
+    blocked_results = []
     for c in candidates[:50]:
         code = str(c.get("code", "")).strip()
         if not code.isdigit() or len(code) != 4:
@@ -2788,6 +2822,19 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         if prev_low <= 0:
             continue
         market = str(c.get("market", "tse")).lower()
+        if code in disposal_codes:
+            blocked_results.append({
+                "code": code,
+                "name": str(c.get("name", code)).strip() or code,
+                "price": 0,
+                "day_low": 0,
+                "prev_low": prev_low,
+                "break_level": round(prev_low * 0.99, 2),
+                "signal": "處置警示",
+                "signal_type": "red",
+                "note": "已列入處置/警示股，停止監測；此策略不適用",
+            })
+            continue
         clean.append({
             "code": code,
             "name": str(c.get("name", code)).strip() or code,
@@ -2796,7 +2843,13 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         })
 
     if not clean:
-        return {"results": [], "market_live": _is_market_live(now), "pushed": [], "updated_at": now.strftime("%H:%M:%S")}
+        return {
+            "results": blocked_results,
+            "market_live": _is_market_live(now),
+            "discord_enabled": _monitor_discord_enabled,
+            "pushed": [],
+            "updated_at": now.strftime("%H:%M:%S"),
+        }
 
     symbols = [_mis_symbol(c["code"], c["market"]) for c in clean]
     rows = _fetch_mis_batch(symbols)
@@ -2806,7 +2859,7 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         if code:
             row_map[code] = row
 
-    results = []
+    results = blocked_results[:]
     pushed = []
     market_live = _is_market_live(now)
 
@@ -2867,7 +2920,7 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         }
         results.append(result)
 
-        if not market_live or signal_type == "neutral":
+        if not market_live or signal_type == "neutral" or not _monitor_discord_enabled:
             continue
 
         slot = _flow_cache_key()
@@ -2883,9 +2936,26 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
     return {
         "results": results,
         "market_live": market_live,
+        "discord_enabled": _monitor_discord_enabled,
         "pushed": pushed,
         "updated_at": now.strftime("%H:%M:%S"),
     }
+
+
+@app.post("/pullback_monitor/discord_on")
+async def pullback_monitor_discord_on(x_token: str = Header(default=None)):
+    verify_token(x_token)
+    global _monitor_discord_enabled
+    _monitor_discord_enabled = True
+    return {"discord_enabled": True}
+
+
+@app.post("/pullback_monitor/discord_off")
+async def pullback_monitor_discord_off(x_token: str = Header(default=None)):
+    verify_token(x_token)
+    global _monitor_discord_enabled
+    _monitor_discord_enabled = False
+    return {"discord_enabled": False}
 
 
 @app.post("/pullback_monitor/test_discord")
