@@ -2885,6 +2885,17 @@ async def pullback_monitor(body: dict, x_token: str = Header(default=None)):
         if day_low <= 0:
             day_low = price
         if price <= 0:
+            results.append({
+                "code": c["code"],
+                "name": c["name"],
+                "price": 0,
+                "day_low": 0,
+                "prev_low": c["prev_low"],
+                "break_level": round(c["prev_low"] * 0.99, 2),
+                "signal": "資料等待",
+                "signal_type": "neutral",
+                "note": "MIS 暫無即時價，保留候選並於下一輪再監測",
+            })
             continue
 
         prev_low = c["prev_low"]
