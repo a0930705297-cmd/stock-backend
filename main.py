@@ -1125,6 +1125,11 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
             prev_ma20 = ma_at(closes, 20, len(closes) - 1)
             prev_ma60 = ma_at(closes, 60, len(closes) - 1)
             avg_vol20 = ma_at(volumes, 20)
+            avg_amount20 = sum(
+                volumes[i] * closes[i] for i in range(len(closes) - 20, len(closes))
+            ) / 20
+            if avg_amount20 < 300_000_000 or avg_vol20 < 3_000_000:
+                continue
             prev_row = price_rows[-2]
             today_open = float(price_rows[-1].get("open", closes[-1]) or closes[-1])
             today_high = float(price_rows[-1].get("max", closes[-1]) or closes[-1])
@@ -1221,6 +1226,8 @@ async def pullback_scan(body: dict, x_token: str = Header(default=None)):
                 "volume": item["volume"],
                 "amount": item["amount"],
                 "amount_yi": item["amount_yi"],
+                "avg_volume20_lots": round(avg_vol20 / 1000),
+                "avg_amount20_yi": round(avg_amount20 / 100_000_000, 2),
                 "signal": signal,
                 "signal_css": signal_css,
                 "score": score
@@ -1773,7 +1780,7 @@ async def chip_scan(
 #  即時內外盤比 v4
 #  最新成交價：intraday/trades 最後一筆，quote 僅作無逐筆資料時的 fallback
 #  全日外盤/內盤：intraday/volumes 分價量表逐列加總
-#  近30筆滾動：intraday/trades Tick Rule 推估
+#  近100筆滾動：intraday/trades Tick Rule 推估
 # ════════════════════════════════════════════════════════════════
 
 _tick_cache: dict = {}
@@ -1902,7 +1909,7 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
     total_day = outer_day + inner_day
     ratio_day = round(outer_day / total_day * 100, 1) if total_day > 0 else 50.0
 
-    # ── 近30筆：trades Tick Rule ──────────────────────────────────
+    # ── 近100筆：trades Tick Rule ─────────────────────────────────
     # Fugle 回傳最新→最舊，先反轉成舊→新，Tick Rule 才能正確比較前一筆。
     trades_data = trades_raw.get("data", [])
     trades_list = list(reversed(trades_data)) if isinstance(trades_data, list) else []
@@ -1973,9 +1980,9 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
             except Exception:
                 latest_price = None
 
-    recent_30 = detail[-30:]
-    r_outer = sum(t["size"] for t in recent_30 if t["side"] == "outer")
-    r_inner = sum(t["size"] for t in recent_30 if t["side"] == "inner")
+    recent_100 = detail[-100:]
+    r_outer = sum(t["size"] for t in recent_100 if t["side"] == "outer")
+    r_inner = sum(t["size"] for t in recent_100 if t["side"] == "inner")
     r_total = r_outer + r_inner
     r_ratio = round(r_outer / r_total * 100, 1) if r_total > 0 else 50.0
 
@@ -2003,7 +2010,7 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         "close_price":  close_price,
         "close_date":   close_date,
         "updated_at":   now.strftime("%H:%M:%S"),
-        "trades":       detail[-50:],
+        "trades":       detail[-100:],
     }
 
     _tick_cache[symbol] = {"data": result, "time": now}
