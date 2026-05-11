@@ -1848,7 +1848,10 @@ def _tick_err(symbol, msg):
         "symbol": symbol, "error": msg,
         "outer": 0, "inner": 0, "ratio": 50, "total": 0,
         "r_outer": 0, "r_inner": 0, "r_ratio": 50,
-        "trade_count": 0, "trades": [], "latest_price": None,
+        "trade_count": 0,
+        "recent_trade_count": 0,
+        "sampled_trade_count": 0,
+        "trades": [], "latest_price": None,
     }
 
 @app.get("/tick_ratio/{symbol}")
@@ -2005,7 +2008,9 @@ async def get_tick_ratio(symbol: str, x_token: str = Header(default=None)):
         "r_outer":      r_outer,
         "r_inner":      r_inner,
         "r_ratio":      r_ratio,
-        "trade_count":  len(detail),
+        "trade_count":  len(recent_100),
+        "recent_trade_count": len(recent_100),
+        "sampled_trade_count": len(detail),
         "latest_price": latest_price,
         "close_price":  close_price,
         "close_date":   close_date,
