@@ -1264,7 +1264,7 @@ def _pi(v) -> int:
     except Exception:
         return 0
 
-def _ma(closes: list, n: int) -> float:
+def _ma_value(closes: list, n: int) -> float:
     valid = [c for c in closes if c and c > 0]
     if not valid:
         return 0.0
@@ -1373,7 +1373,7 @@ async def get_emerging_analysis(x_token: str = Header(default=None)):
             # 20MA
             hist   = finmind_get("TaiwanStockPrice", code, start_90, end_date)
             closes = [float(x.get("close", 0)) for x in hist if x.get("close")]
-            ma20   = _ma(closes, 20)
+            ma20   = _ma_value(closes, 20)
             if ma20 > 0 and price <= ma20:
                 continue
 
@@ -3056,7 +3056,7 @@ async def test_pullback_monitor_discord(body: dict = None, x_token: str = Header
 import math as _math
 
 
-def _ma(values, period):
+def _ma_series(values, period):
     result = []
     for i in range(len(values)):
         if i < period - 1:
@@ -3103,12 +3103,21 @@ def _rsi(closes, period=14):
     diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
     ag = sum(max(d, 0) for d in diffs[:period]) / period
     al = sum(max(-d, 0) for d in diffs[:period]) / period
-    result[period] = round(100 - 100 / (1 + ag / al), 2) if al > 0 else 100.0
+
+    def _rsi_value(avg_gain, avg_loss):
+        if avg_gain == 0 and avg_loss == 0:
+            return 50.0
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100 - 100 / (1 + rs), 2)
+
+    result[period] = _rsi_value(ag, al)
     for i in range(period + 1, len(closes)):
         d = closes[i] - closes[i - 1]
         ag = (ag * (period - 1) + max(d, 0)) / period
         al = (al * (period - 1) + max(-d, 0)) / period
-        result[i] = round(100 - 100 / (1 + ag / al), 2) if al > 0 else 100.0
+        result[i] = _rsi_value(ag, al)
     return result
 
 
@@ -3125,14 +3134,18 @@ def _macd_calc(closes, fast=12, slow=26, signal_p=9):
 
 def _kd(highs, lows, closes, period=9, smooth=3):
     n = len(closes)
-    K = [50.0] * n
-    D = [50.0] * n
+    K = [None] * n
+    D = [None] * n
+    prev_k = 50.0
+    prev_d = 50.0
     for i in range(period - 1, n):
         lo  = min(lows[i - period + 1:i + 1])
         hi  = max(highs[i - period + 1:i + 1])
         rsv = (closes[i] - lo) / (hi - lo) * 100 if hi > lo else 50.0
-        K[i] = round(K[i - 1] * (smooth - 1) / smooth + rsv / smooth, 2)
-        D[i] = round(D[i - 1] * (smooth - 1) / smooth + K[i] / smooth, 2)
+        prev_k = prev_k * (smooth - 1) / smooth + rsv / smooth
+        prev_d = prev_d * (smooth - 1) / smooth + prev_k / smooth
+        K[i] = round(prev_k, 2)
+        D[i] = round(prev_d, 2)
     return K, D
 
 
@@ -3182,6 +3195,25 @@ def _detect_pattern(opens, highs, lows, closes):
     return "紅K" if c >= o else "黑K"
 
 
+def _atr_buffer_pct(highs, lows, closes, period=10):
+    n = min(period, len(closes))
+    if n < 2:
+        return 0.021
+    start = len(closes) - n
+    tr_pcts = []
+    for i in range(start, len(closes)):
+        prev_close = closes[i - 1] if i > 0 else closes[i]
+        base = prev_close or closes[i] or 1
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - prev_close),
+            abs(lows[i] - prev_close),
+        )
+        tr_pcts.append(tr / base)
+    avg_pct = sum(tr_pcts) / len(tr_pcts) if tr_pcts else 0.021
+    return min(max(avg_pct * 0.8, 0.015), 0.04)
+
+
 def _swing_levels(highs, lows, closes, lookback=60, wing=2):
     n   = min(lookback, len(closes))
     h   = highs[-n:]
@@ -3195,9 +3227,21 @@ def _swing_levels(highs, lows, closes, lookback=60, wing=2):
         if all(l[i] < l[i - k] for k in range(1, wing + 1)) and \
            all(l[i] < l[i + k] for k in range(1, wing + 1)):
             pl.append(l[i])
-    sup = max((p for p in pl if p < cur), default=round(min(l) * 0.99, 2))
-    res = min((p for p in ph if p > cur), default=round(max(h) * 1.01, 2))
-    return round(sup, 2), round(res, 2)
+    sup_candidates = [p for p in pl if p < cur]
+    res_candidates = [p for p in ph if p > cur]
+    if sup_candidates:
+        sup = max(sup_candidates)
+        sup_label = "近期低點"
+    else:
+        sup = round(min(l) * 0.99, 2)
+        sup_label = "區間低點"
+    if res_candidates:
+        res = min(res_candidates)
+        res_label = "近期高點"
+    else:
+        res = round(max(h) * 1.01, 2)
+        res_label = "區間高點"
+    return round(sup, 2), round(res, 2), sup_label, res_label
 
 
 def _trend_label(ma5, ma10, ma20, ma60):
@@ -3247,13 +3291,14 @@ def _build_analysis(symbol, name, closes, opens, highs, lows, volumes,
         return {"error": "no data"}
     cur     = closes[-1]
     pattern = _detect_pattern(opens, highs, lows, closes)
-    sup, res = _swing_levels(highs, lows, closes)
+    sup, res, sup_label, res_label = _swing_levels(highs, lows, closes)
     trend   = _trend_label(ma5, ma10, ma20, ma60)
     ch      = _lin_channel(closes)
-    defense = round(sup * 0.979, 2)
+    defense_pct = _atr_buffer_pct(highs, lows, closes)
+    defense = round(sup * (1 - defense_pct), 2)
     risk    = cur - defense
     reward  = res - cur
-    rr      = round(reward / risk, 2) if risk > 0 and reward > 0 else 0.0
+    rr      = round(reward / risk, 2) if risk > 0 and reward > 0 else None
     m5, m10, m20, m60 = ma5[-1], ma10[-1], ma20[-1], ma60[-1]
     gap20   = round((cur / m20 - 1) * 100, 2) if m20 else None
     rv = rsi[-1]
@@ -3261,9 +3306,12 @@ def _build_analysis(symbol, name, closes, opens, highs, lows, volumes,
              f"超賣（{rv}）" if rv is not None and rv < 30 else
              f"中性（{rv}）" if rv is not None else "—")
     kv    = k_v[-1]
-    kd_s  = (f"超買（K={kv:.1f}）" if kv > 80 else
-             f"超賣（K={kv:.1f}）" if kv < 20 else
-             f"中性（K={kv:.1f}）")
+    kd_s  = (
+        f"超買（K={kv:.1f}）" if kv is not None and kv > 80 else
+        f"超賣（K={kv:.1f}）" if kv is not None and kv < 20 else
+        f"中性（K={kv:.1f}）" if kv is not None else
+        "—"
+    )
     mv, sv = macd_v[-1], sig_v[-1]
     macd_s = (
         "MACD 金叉偏多" if mv is not None and sv is not None and mv > sv else
@@ -3289,22 +3337,31 @@ def _build_analysis(symbol, name, closes, opens, highs, lows, volumes,
             ops = f"多頭結構未破，優先觀察回測 20MA（{m20}）或支撐 {sup} 附近的承接，不急著追價。"
     elif trend == "下降趨勢":
         ops = f"均線空頭排列，暫不建議偏多操作；先觀望，等待重新站回關鍵均線或支撐止穩後再評估。"
+    elif trend == "資料不足":
+        ops = "資料長度不足，先以近期 K 線與量價結構觀察，不急著依賴均線結論。"
     else:
         ops = f"目前偏區間整理，先看是否帶量突破 {res} 或跌破 {sup}；未表態前以觀察為主。"
 
     dist_def = round((defense / cur - 1) * 100, 1) if cur else 0
-    if rr >= 2:
+    if rr is not None and rr >= 2:
         risk_reward_note = f"損益比 {rr}，報酬優於風險"
         safe_label = "✓ 可列觀察"
+        safe_tone = "ok"
         is_safe = True
+    elif rr is not None and rr >= 1:
+        risk_reward_note = f"損益比 {rr}，空間普通，建議等更好的位置"
+        safe_label = "△ 等更好位置"
+        safe_tone = "wait"
+        is_safe = False
     else:
-        risk_reward_note = "目前風險報酬不佳，建議先觀察"
+        risk_reward_note = "目前上方空間不足或防守位不適合，建議先觀察"
         safe_label = "✗ 不宜追價"
+        safe_tone = "warn"
         is_safe = False
     details = [
         f"防守位 {defense}（距現價 {dist_def:+.1f}%），{risk_reward_note}",
-        f"支撐 {sup}（近期擺動低點）",
-        f"壓力 {res}（近期擺動高點）",
+        f"支撐 {sup}（{sup_label}）",
+        f"壓力 {res}（{res_label}）",
         f"趨勢：{trend}",
     ]
     if gap20 is not None:
@@ -3321,8 +3378,9 @@ def _build_analysis(symbol, name, closes, opens, highs, lows, volumes,
         "pattern": pattern, "ops_main": ops, "ops_detail": details,
         "trend": trend,
         "support": sup, "resistance": res, "defense": defense,
+        "support_label": sup_label, "resistance_label": res_label,
         "rr_ratio": rr, "is_safe": is_safe,
-        "safe_label": safe_label,
+        "safe_label": safe_label, "safe_tone": safe_tone,
         "rsi_status": rsi_s, "kd_status": kd_s,
         "macd_status": macd_s, "obv_trend": obv_trend,
         "ma5": m5, "ma10": m10, "ma20": m20, "ma60": m60,
@@ -3354,10 +3412,10 @@ async def stock_deep(symbol: str, days: int = 120, x_token: str = Header(default
     lows_all    = [float(r.get("min",   0)) for r in rows_all]
     closes_all  = [float(r.get("close", 0)) for r in rows_all]
     volumes_all = [int(r.get("Trading_Volume", 0)) // 1000 for r in rows_all]
-    ma5_all  = _ma(closes_all, 5)
-    ma10_all = _ma(closes_all, 10)
-    ma20_all = _ma(closes_all, 20)
-    ma60_all = _ma(closes_all, 60)
+    ma5_all  = _ma_series(closes_all, 5)
+    ma10_all = _ma_series(closes_all, 10)
+    ma20_all = _ma_series(closes_all, 20)
+    ma60_all = _ma_series(closes_all, 60)
     bbu_all, bbm_all, bbl_all = _bollinger(closes_all)
     rsi_all               = _rsi(closes_all)
     macd_all, sig_all, mh_all = _macd_calc(closes_all)
