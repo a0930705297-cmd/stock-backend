@@ -3606,48 +3606,90 @@ async def us_stock(symbol: str, period: str = "6mo", x_token: str = Header(defau
     vols_all   = [r["volume"] for r in _rows]
 
     # ── Step 2: 基本面資料（quoteSummary API，失敗時降級顯示 N/A）──
+    def _raw(d, k):
+        v = d.get(k)
+        return v.get("raw") if isinstance(v, dict) else v
+
     info = {}
-    _qs_url = (
-        f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-        f"?modules=summaryDetail,defaultKeyStatistics,financialData,assetProfile,price"
-    )
+
+    # ── Step 2a: v7/quote（不需 crumb，取基本行情與估值）──
     try:
-        async with httpx.AsyncClient(timeout=15, verify=False) as _c:
-            _qr = await _c.get(_qs_url, headers=_YF_HEADERS)
-            _qr.raise_for_status()
-            _qs = _qr.json()
-        _qs_res = ((_qs.get("quoteSummary") or {}).get("result") or [{}])[0]
-        _sd = _qs_res.get("summaryDetail",       {})
-        _ks = _qs_res.get("defaultKeyStatistics", {})
-        _fd = _qs_res.get("financialData",        {})
-        _ap = _qs_res.get("assetProfile",         {})
-        _pr = _qs_res.get("price",                {})
-
-        def _raw(d, k):
-            v = d.get(k)
-            return v.get("raw") if isinstance(v, dict) else v
-
-        info = {
-            "longName":           _raw(_pr, "longName") or _raw(_pr, "shortName") or symbol,
-            "trailingPE":         _raw(_sd, "trailingPE"),
-            "forwardPE":          _raw(_sd, "forwardPE"),
-            "trailingEps":        _raw(_ks, "trailingEps"),
-            "totalRevenue":       _raw(_fd, "totalRevenue"),
-            "profitMargins":      _raw(_fd, "profitMargins"),
-            "grossMargins":       _raw(_fd, "grossMargins"),
-            "marketCap":          _raw(_pr, "marketCap"),
-            "priceToBook":        _raw(_ks, "priceToBook"),
-            "debtToEquity":       _raw(_fd, "debtToEquity"),
-            "dividendYield":      _raw(_sd, "dividendYield"),
-            "targetMeanPrice":    _raw(_fd, "targetMeanPrice"),
-            "fiftyTwoWeekHigh":   _raw(_sd, "fiftyTwoWeekHigh"),
-            "fiftyTwoWeekLow":    _raw(_sd, "fiftyTwoWeekLow"),
-            "sector":             _ap.get("sector", ""),
-            "industry":           _ap.get("industry", ""),
-            "longBusinessSummary": (_ap.get("longBusinessSummary") or "")[:600],
-        }
+        async with httpx.AsyncClient(timeout=12, verify=False) as _c:
+            _v7r = await _c.get(
+                f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}",
+                headers=_YF_HEADERS,
+            )
+            _v7r.raise_for_status()
+            _q7 = ((_v7r.json().get("quoteResponse") or {}).get("result") or [{}])[0]
+        info.update({
+            "longName":         _q7.get("longName") or _q7.get("shortName") or symbol,
+            "marketCap":        _q7.get("marketCap"),
+            "trailingPE":       _q7.get("trailingPE"),
+            "forwardPE":        _q7.get("forwardPE"),
+            "trailingEps":      _q7.get("epsTrailingTwelveMonths"),
+            "dividendYield":    _q7.get("trailingAnnualDividendYield"),
+            "priceToBook":      _q7.get("priceToBook"),
+            "fiftyTwoWeekHigh": _q7.get("fiftyTwoWeekHigh"),
+            "fiftyTwoWeekLow":  _q7.get("fiftyTwoWeekLow"),
+        })
     except Exception:
-        info = {}
+        pass
+
+    # ── Step 2b: quoteSummary with crumb（取利潤率/營收/D/E/目標價/產業等深度資料）──
+    try:
+        async with httpx.AsyncClient(timeout=10, verify=False) as _c:
+            _cr = await _c.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb",
+                headers=_YF_HEADERS,
+            )
+            _crumb = _cr.text.strip()
+            _yf_cookies = dict(_cr.cookies)
+
+        if _crumb:
+            _mods = "summaryDetail,defaultKeyStatistics,financialData,assetProfile,price"
+            async with httpx.AsyncClient(timeout=15, verify=False) as _c:
+                _qr = await _c.get(
+                    f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+                    f"?modules={_mods}&crumb={_crumb}",
+                    headers=_YF_HEADERS,
+                    cookies=_yf_cookies,
+                )
+                _qr.raise_for_status()
+                _qs = _qr.json()
+            _qs_res = ((_qs.get("quoteSummary") or {}).get("result") or [{}])[0]
+            _sd = _qs_res.get("summaryDetail",        {})
+            _ks = _qs_res.get("defaultKeyStatistics", {})
+            _fd = _qs_res.get("financialData",         {})
+            _ap = _qs_res.get("assetProfile",          {})
+            _pr = _qs_res.get("price",                 {})
+            _deep = {
+                "longName":            _raw(_pr, "longName") or _raw(_pr, "shortName"),
+                "marketCap":           _raw(_pr, "marketCap"),
+                "trailingPE":          _raw(_sd, "trailingPE"),
+                "forwardPE":           _raw(_sd, "forwardPE"),
+                "trailingEps":         _raw(_ks, "trailingEps"),
+                "totalRevenue":        _raw(_fd, "totalRevenue"),
+                "profitMargins":       _raw(_fd, "profitMargins"),
+                "grossMargins":        _raw(_fd, "grossMargins"),
+                "priceToBook":         _raw(_ks, "priceToBook"),
+                "debtToEquity":        _raw(_fd, "debtToEquity"),
+                "dividendYield":       _raw(_sd, "dividendYield"),
+                "targetMeanPrice":     _raw(_fd, "targetMeanPrice"),
+                "fiftyTwoWeekHigh":    _raw(_sd, "fiftyTwoWeekHigh"),
+                "fiftyTwoWeekLow":     _raw(_sd, "fiftyTwoWeekLow"),
+                "sector":              _ap.get("sector", ""),
+                "industry":            _ap.get("industry", ""),
+                "longBusinessSummary": (_ap.get("longBusinessSummary") or "")[:600],
+            }
+            # 只覆蓋有值的欄位（保留 v7 已取得的資料）
+            info.update({k: v for k, v in _deep.items() if v is not None and v != ""})
+    except Exception:
+        pass
+
+    # 從 chart meta 補 longName（v7/quoteSummary 都失敗時的最後備援）
+    if not info.get("longName"):
+        _chart_meta = ((_chart.get("chart") or {}).get("result") or [{}])[0].get("meta", {})
+        info["longName"] = _chart_meta.get("longName") or _chart_meta.get("shortName") or symbol
 
     ma5_all   = _ma_series(closes_all, 5)
     ma10_all  = _ma_series(closes_all, 10)
