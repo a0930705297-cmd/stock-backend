@@ -3547,58 +3547,107 @@ async def us_stock(symbol: str, period: str = "6mo", x_token: str = Header(defau
     period_rows = {"1mo": 22, "3mo": 66, "6mo": 130, "1y": 260, "2y": 520}
     target_rows = period_rows[period]
 
-    import pandas as _pd
+    _YF_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
 
-    # ── Step 1: 價格資料（yf.download 用不同 endpoint，較不易被限速）──
-    hist = None
-    last_err = ""
-    for _attempt in range(3):
-        try:
-            hist = yf.download(
-                symbol, period=extra_map[period], interval="1d",
-                auto_adjust=True, progress=False, threads=False,
-            )
-            # yfinance >=0.2.48 單一 ticker 可能回傳 MultiIndex columns
-            if isinstance(hist.columns, _pd.MultiIndex):
-                hist.columns = hist.columns.get_level_values(0)
-            last_err = ""
-            break
-        except Exception as e:
-            last_err = str(e)
-            if _attempt < 2:
-                await asyncio.sleep(3)
-
-    if hist is None or (hasattr(hist, "empty") and hist.empty):
-        return {"error": f"找不到 {symbol} 的股價資料，請確認代碼是否正確（{last_err}）"}
-
-    # ── Step 2: 基本面資料（失敗時降級，K 線圖仍可顯示）──
-    info = {}
-    _ticker_obj = yf.Ticker(symbol)
+    # ── Step 1: 價格資料（直接打 Yahoo Finance chart API，不走 yfinance library）──
+    chart_url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?interval=1d&range={extra_map[period]}&includePrePost=false"
+    )
     try:
-        info = _ticker_obj.info or {}
+        async with httpx.AsyncClient(timeout=20, verify=False) as _c:
+            _r = await _c.get(chart_url, headers=_YF_HEADERS)
+            _r.raise_for_status()
+            _chart = _r.json()
+    except Exception as e:
+        return {"error": f"無法取得 {symbol} 股價資料：{str(e)}"}
+
+    _result_list = (_chart.get("chart") or {}).get("result") or []
+    if not _result_list:
+        _err_obj = (_chart.get("chart") or {}).get("error") or {}
+        return {"error": f"找不到 {symbol}，請確認代碼是否正確（{_err_obj.get('description', '無資料')}）"}
+
+    _cr   = _result_list[0]
+    _ts   = _cr.get("timestamp") or []
+    _q    = (_cr.get("indicators") or {}).get("quote", [{}])[0]
+    _opens_r  = _q.get("open",   [])
+    _highs_r  = _q.get("high",   [])
+    _lows_r   = _q.get("low",    [])
+    _closes_r = _q.get("close",  [])
+    _vols_r   = _q.get("volume", [])
+
+    _rows = []
+    for _i, _stamp in enumerate(_ts):
+        _o = _opens_r[_i]  if _i < len(_opens_r)  else None
+        _h = _highs_r[_i]  if _i < len(_highs_r)  else None
+        _l = _lows_r[_i]   if _i < len(_lows_r)   else None
+        _cl = _closes_r[_i] if _i < len(_closes_r) else None
+        _v  = _vols_r[_i]   if _i < len(_vols_r)   else None
+        if None in (_o, _h, _l, _cl):
+            continue
+        _rows.append({
+            "date":   datetime.fromtimestamp(_stamp, tz=timezone.utc).strftime("%Y-%m-%d"),
+            "open":   float(_o), "high": float(_h),
+            "low":    float(_l), "close": float(_cl),
+            "volume": int(_v) if (_v is not None and _math.isfinite(float(_v))) else 0,
+        })
+
+    if not _rows:
+        return {"error": f"找不到 {symbol} 的股價資料，請確認代碼是否正確"}
+
+    dates_all  = [r["date"]   for r in _rows]
+    opens_all  = [r["open"]   for r in _rows]
+    highs_all  = [r["high"]   for r in _rows]
+    lows_all   = [r["low"]    for r in _rows]
+    closes_all = [r["close"]  for r in _rows]
+    vols_all   = [r["volume"] for r in _rows]
+
+    # ── Step 2: 基本面資料（quoteSummary API，失敗時降級顯示 N/A）──
+    info = {}
+    _qs_url = (
+        f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+        f"?modules=summaryDetail,defaultKeyStatistics,financialData,assetProfile,price"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False) as _c:
+            _qr = await _c.get(_qs_url, headers=_YF_HEADERS)
+            _qr.raise_for_status()
+            _qs = _qr.json()
+        _qs_res = ((_qs.get("quoteSummary") or {}).get("result") or [{}])[0]
+        _sd = _qs_res.get("summaryDetail",       {})
+        _ks = _qs_res.get("defaultKeyStatistics", {})
+        _fd = _qs_res.get("financialData",        {})
+        _ap = _qs_res.get("assetProfile",         {})
+        _pr = _qs_res.get("price",                {})
+
+        def _raw(d, k):
+            v = d.get(k)
+            return v.get("raw") if isinstance(v, dict) else v
+
+        info = {
+            "longName":           _raw(_pr, "longName") or _raw(_pr, "shortName") or symbol,
+            "trailingPE":         _raw(_sd, "trailingPE"),
+            "forwardPE":          _raw(_sd, "forwardPE"),
+            "trailingEps":        _raw(_ks, "trailingEps"),
+            "totalRevenue":       _raw(_fd, "totalRevenue"),
+            "profitMargins":      _raw(_fd, "profitMargins"),
+            "grossMargins":       _raw(_fd, "grossMargins"),
+            "marketCap":          _raw(_pr, "marketCap"),
+            "priceToBook":        _raw(_ks, "priceToBook"),
+            "debtToEquity":       _raw(_fd, "debtToEquity"),
+            "dividendYield":      _raw(_sd, "dividendYield"),
+            "targetMeanPrice":    _raw(_fd, "targetMeanPrice"),
+            "fiftyTwoWeekHigh":   _raw(_sd, "fiftyTwoWeekHigh"),
+            "fiftyTwoWeekLow":    _raw(_sd, "fiftyTwoWeekLow"),
+            "sector":             _ap.get("sector", ""),
+            "industry":           _ap.get("industry", ""),
+            "longBusinessSummary": (_ap.get("longBusinessSummary") or "")[:600],
+        }
     except Exception:
-        # fast_info 涵蓋市值、52週高低等基本欄位
-        try:
-            fi = _ticker_obj.fast_info
-            info = {
-                "longName": symbol,
-                "marketCap":        getattr(fi, "market_cap",  None),
-                "fiftyTwoWeekHigh": getattr(fi, "year_high",   None),
-                "fiftyTwoWeekLow":  getattr(fi, "year_low",    None),
-            }
-        except Exception:
-            info = {}
-
-    if hist is None or hist.empty:
-        return {"error": f"無法取得 {symbol} 資料"}
-
-    hist = hist.dropna(subset=["Open", "High", "Low", "Close"])
-    dates_all  = [d.strftime("%Y-%m-%d") for d in hist.index]
-    opens_all  = [float(v) for v in hist["Open"].tolist()]
-    highs_all  = [float(v) for v in hist["High"].tolist()]
-    lows_all   = [float(v) for v in hist["Low"].tolist()]
-    closes_all = [float(v) for v in hist["Close"].tolist()]
-    vols_all   = [int(v) if _math.isfinite(float(v)) else 0 for v in hist["Volume"].tolist()]
+        info = {}
 
     ma5_all   = _ma_series(closes_all, 5)
     ma10_all  = _ma_series(closes_all, 10)
