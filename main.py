@@ -3547,12 +3547,22 @@ async def us_stock(symbol: str, period: str = "6mo", x_token: str = Header(defau
     period_rows = {"1mo": 22, "3mo": 66, "6mo": 130, "1y": 260, "2y": 520}
     target_rows = period_rows[period]
 
-    try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period=extra_map[period], interval="1d")
-        info = ticker.info
-    except Exception as e:
-        return {"error": f"無法取得 {symbol} 資料: {str(e)}"}
+    hist = None
+    info = {}
+    last_err = ""
+    for _attempt in range(3):
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period=extra_map[period], interval="1d")
+            info = ticker.info or {}
+            last_err = ""
+            break
+        except Exception as e:
+            last_err = str(e)
+            if _attempt < 2:
+                await asyncio.sleep(2 ** _attempt)  # 1s, 2s
+    if last_err:
+        return {"error": f"無法取得 {symbol} 資料: {last_err}"}
 
     if hist is None or hist.empty:
         return {"error": f"無法取得 {symbol} 資料"}
