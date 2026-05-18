@@ -3547,22 +3547,47 @@ async def us_stock(symbol: str, period: str = "6mo", x_token: str = Header(defau
     period_rows = {"1mo": 22, "3mo": 66, "6mo": 130, "1y": 260, "2y": 520}
     target_rows = period_rows[period]
 
+    import pandas as _pd
+
+    # ── Step 1: 價格資料（yf.download 用不同 endpoint，較不易被限速）──
     hist = None
-    info = {}
     last_err = ""
     for _attempt in range(3):
         try:
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period=extra_map[period], interval="1d")
-            info = ticker.info or {}
+            hist = yf.download(
+                symbol, period=extra_map[period], interval="1d",
+                auto_adjust=True, progress=False, threads=False,
+            )
+            # yfinance >=0.2.48 單一 ticker 可能回傳 MultiIndex columns
+            if isinstance(hist.columns, _pd.MultiIndex):
+                hist.columns = hist.columns.get_level_values(0)
             last_err = ""
             break
         except Exception as e:
             last_err = str(e)
             if _attempt < 2:
-                await asyncio.sleep(2 ** _attempt)  # 1s, 2s
-    if last_err:
-        return {"error": f"無法取得 {symbol} 資料: {last_err}"}
+                await asyncio.sleep(3)
+
+    if hist is None or (hasattr(hist, "empty") and hist.empty):
+        return {"error": f"找不到 {symbol} 的股價資料，請確認代碼是否正確（{last_err}）"}
+
+    # ── Step 2: 基本面資料（失敗時降級，K 線圖仍可顯示）──
+    info = {}
+    _ticker_obj = yf.Ticker(symbol)
+    try:
+        info = _ticker_obj.info or {}
+    except Exception:
+        # fast_info 涵蓋市值、52週高低等基本欄位
+        try:
+            fi = _ticker_obj.fast_info
+            info = {
+                "longName": symbol,
+                "marketCap":        getattr(fi, "market_cap",  None),
+                "fiftyTwoWeekHigh": getattr(fi, "year_high",   None),
+                "fiftyTwoWeekLow":  getattr(fi, "year_low",    None),
+            }
+        except Exception:
+            info = {}
 
     if hist is None or hist.empty:
         return {"error": f"無法取得 {symbol} 資料"}
