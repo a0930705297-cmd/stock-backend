@@ -2,6 +2,7 @@ import httpx
 import requests
 import warnings
 import os
+import json as _json
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
@@ -3466,4 +3467,222 @@ async def stock_deep(symbol: str, days: int = 120, x_token: str = Header(default
     result = {"symbol": symbol, "name": stock_name, "candles": candles, "analysis": analysis}
     _stock_deep_cache[cache_key] = {"data": result, "time": now}
     _prune_stock_deep_cache(now)
+    return result
+
+
+# ── 美股深度分析：K線圖 + AI分析報告 ──────────────────────────────────────
+
+_us_stock_cache: dict = {}
+_US_STOCK_CACHE_SEC = 600  # 10-minute cache for US stocks (Claude API call)
+
+def _prune_us_stock_cache(now: datetime):
+    stale = [k for k, v in _us_stock_cache.items()
+             if (now - v["time"]).total_seconds() >= _US_STOCK_CACHE_SEC]
+    for k in stale:
+        _us_stock_cache.pop(k, None)
+
+
+async def _call_claude_haiku(prompt: str) -> str:
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1800,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"]
+
+
+def _fmt_num(n, suffix=""):
+    if n is None:
+        return "N/A"
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not _math.isfinite(v):
+        return "N/A"
+    if abs(v) >= 1e12:
+        return f"{v/1e12:.2f}T{suffix}"
+    if abs(v) >= 1e9:
+        return f"{v/1e9:.2f}B{suffix}"
+    if abs(v) >= 1e6:
+        return f"{v/1e6:.2f}M{suffix}"
+    return f"{v:.2f}{suffix}"
+
+
+def _safe_fin(v, dec=2):
+    """Convert yfinance float to JSON-safe value; returns None for None/NaN/Inf."""
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+        return None if not _math.isfinite(fv) else round(fv, dec)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/us_stock/{symbol}")
+async def us_stock(symbol: str, period: str = "6mo", x_token: str = Header(default=None)):
+    """美股深度分析：K線圖 + AI分析報告（yfinance + Claude Haiku）"""
+    verify_token(x_token)
+    symbol = str(symbol).upper().strip()
+    period = period if period in ("1mo", "3mo", "6mo", "1y", "2y") else "6mo"
+    now = tw_now()
+    cache_key = f"{symbol}_{period}"
+    cached = _us_stock_cache.get(cache_key)
+    if cached and (now - cached["time"]).total_seconds() < _US_STOCK_CACHE_SEC:
+        return cached["data"]
+
+    # Fetch extra history for indicator warm-up, then trim
+    extra_map = {"1mo": "3mo", "3mo": "6mo", "6mo": "1y", "1y": "2y", "2y": "5y"}
+    period_rows = {"1mo": 22, "3mo": 66, "6mo": 130, "1y": 260, "2y": 520}
+    target_rows = period_rows[period]
+
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=extra_map[period], interval="1d")
+        info = ticker.info
+    except Exception as e:
+        return {"error": f"無法取得 {symbol} 資料: {str(e)}"}
+
+    if hist is None or hist.empty:
+        return {"error": f"無法取得 {symbol} 資料"}
+
+    hist = hist.dropna(subset=["Open", "High", "Low", "Close"])
+    dates_all  = [d.strftime("%Y-%m-%d") for d in hist.index]
+    opens_all  = [float(v) for v in hist["Open"].tolist()]
+    highs_all  = [float(v) for v in hist["High"].tolist()]
+    lows_all   = [float(v) for v in hist["Low"].tolist()]
+    closes_all = [float(v) for v in hist["Close"].tolist()]
+    vols_all   = [int(v) if _math.isfinite(float(v)) else 0 for v in hist["Volume"].tolist()]
+
+    ma5_all   = _ma_series(closes_all, 5)
+    ma10_all  = _ma_series(closes_all, 10)
+    ma20_all  = _ma_series(closes_all, 20)
+    ma60_all  = _ma_series(closes_all, 60)
+    bbu_all, bbm_all, bbl_all = _bollinger(closes_all)
+    rsi_all             = _rsi(closes_all)
+    macd_all, sig_all, mh_all = _macd_calc(closes_all)
+    k_all, d_all        = _kd(highs_all, lows_all, closes_all)
+    obv_all             = _obv(closes_all, vols_all)
+
+    si = max(0, len(closes_all) - target_rows)
+    dates  = dates_all[si:];   opens  = opens_all[si:];   highs  = highs_all[si:]
+    lows   = lows_all[si:];    closes = closes_all[si:];  volumes = vols_all[si:]
+    ma5_v  = ma5_all[si:];     ma10_v = ma10_all[si:];    ma20_v = ma20_all[si:]
+    ma60_v = ma60_all[si:];    bbu    = bbu_all[si:];     bbm    = bbm_all[si:]
+    bbl    = bbl_all[si:];     rsi_v  = rsi_all[si:];     macd_v = macd_all[si:]
+    sig_v  = sig_all[si:];     mh_v   = mh_all[si:];      k_v    = k_all[si:]
+    d_v    = d_all[si:];       obv_v  = obv_all[si:]
+
+    stock_name = info.get("longName") or info.get("shortName") or symbol
+
+    candles = [{
+        "time": dates[i], "open": round(opens[i], 4), "high": round(highs[i], 4),
+        "low": round(lows[i], 4), "close": round(closes[i], 4), "volume": volumes[i],
+        "ma5": ma5_v[i], "ma10": ma10_v[i], "ma20": ma20_v[i], "ma60": ma60_v[i],
+        "bb_upper": bbu[i], "bb_middle": bbm[i], "bb_lower": bbl[i],
+        "rsi": rsi_v[i], "macd": macd_v[i], "signal": sig_v[i], "hist": mh_v[i],
+        "k": k_v[i], "d": d_v[i], "obv": obv_v[i],
+    } for i in range(len(dates))]
+
+    technicals = _build_analysis(
+        symbol, stock_name, closes, opens, highs, lows, volumes,
+        ma5_v, ma10_v, ma20_v, ma60_v, rsi_v, macd_v, sig_v, mh_v,
+        k_v, d_v, obv_v, bbu, bbm, bbl,
+    )
+
+    pe       = info.get("trailingPE")
+    fwd_pe   = info.get("forwardPE")
+    eps      = info.get("trailingEps")
+    rev      = info.get("totalRevenue")
+    pm       = info.get("profitMargins")
+    gm       = info.get("grossMargins")
+    mktcap   = info.get("marketCap")
+    ptb      = info.get("priceToBook")
+    dte      = info.get("debtToEquity")
+    div_y    = info.get("dividendYield")
+    tgt      = info.get("targetMeanPrice")
+    w52h     = info.get("fiftyTwoWeekHigh")
+    w52l     = info.get("fiftyTwoWeekLow")
+    sector   = info.get("sector", "")
+    industry = info.get("industry", "")
+    summary  = (info.get("longBusinessSummary") or "")[:600]
+    price    = closes[-1] if closes else 0
+
+    ai_report = None
+    if ANTHROPIC_API_KEY:
+        prompt = f"""你是一位專業美股分析師。請根據以下資料，用繁體中文生成一份股票分析報告，\
+輸出嚴格合法的 JSON（不加 ```json``` 標記）。
+
+股票: {symbol} / {stock_name}
+產業: {sector} / {industry}
+股價: ${price:.2f}  52W H/L: {_fmt_num(w52h, " USD")} / {_fmt_num(w52l, " USD")}
+市值: {_fmt_num(mktcap, " USD")}
+P/E(TTM): {_fmt_num(pe)}  Forward P/E: {_fmt_num(fwd_pe)}  P/B: {_fmt_num(ptb)}
+EPS: {_fmt_num(eps, " USD")}  總營收: {_fmt_num(rev, " USD")}
+淨利率: {f"{pm*100:.1f}%" if (pm is not None and _math.isfinite(pm)) else "N/A"}  毛利率: {f"{gm*100:.1f}%" if (gm is not None and _math.isfinite(gm)) else "N/A"}
+負債/股東權益: {_fmt_num(dte)}  殖利率: {f"{div_y*100:.2f}%" if (div_y is not None and _math.isfinite(div_y)) else "N/A"}
+分析師目標價: {_fmt_num(tgt, " USD")}
+
+技術面: 趨勢={technicals.get("trend")} RSI={technicals.get("rsi_status")} \
+MACD={technicals.get("macd_status")} 型態={technicals.get("pattern")} \
+支撐=${technicals.get("support")} 壓力=${technicals.get("resistance")} \
+損益比={technicals.get("rr_ratio")}
+
+業務摘要: {summary}
+
+JSON 格式（所有欄位必須存在）:
+{{
+  "financial_highlights": ["重點1", "重點2", "重點3"],
+  "catalysts": ["催化劑1", "催化劑2", "催化劑3"],
+  "technical_analysis": "技術面綜合描述（2-3句）",
+  "financial_data": {{"pe_comment": "本益比評估", "revenue_comment": "營收成長評估", "profitability": "獲利能力評估"}},
+  "business_segments": "主要業務版塊說明（1-2句）",
+  "guidance": "基於產業趨勢的營運展望（1-2句）",
+  "risks": ["風險1", "風險2", "風險3"],
+  "overall_assessment": "綜合評估與投資評級（3-4句）",
+  "key_metrics": ["觀察指標1（說明預期）", "觀察指標2（說明預期）", "觀察指標3（說明預期）"]
+}}"""
+        try:
+            raw = await _call_claude_haiku(prompt)
+            start = raw.find("{")
+            end   = raw.rfind("}") + 1
+            if start == -1 or end <= start:
+                raise ValueError("no JSON object in response")
+            ai_report = _json.loads(raw[start:end])
+        except Exception:
+            ai_report = None
+
+    result = {
+        "symbol": symbol, "name": stock_name,
+        "sector": sector, "industry": industry,
+        "price": round(price, 2),
+        "market_cap": _safe_fin(mktcap, 0),
+        "pe_ratio":      _safe_fin(pe),
+        "fwd_pe":        _safe_fin(fwd_pe),
+        "eps":           _safe_fin(eps),
+        "revenue":       _safe_fin(rev, 0),
+        "profit_margin": _safe_fin(None if pm is None else pm * 100),
+        "gross_margin":  _safe_fin(None if gm is None else gm * 100),
+        "price_to_book": _safe_fin(ptb),
+        "debt_to_equity":_safe_fin(dte),
+        "dividend_yield":_safe_fin(None if div_y is None else div_y * 100),
+        "analyst_target":_safe_fin(tgt),
+        "week52_high": _safe_fin(w52h), "week52_low": _safe_fin(w52l),
+        "candles": candles,
+        "technicals": technicals,
+        "ai_report": ai_report,
+    }
+    _us_stock_cache[cache_key] = {"data": result, "time": now}
+    _prune_us_stock_cache(now)
     return result
